@@ -1,55 +1,55 @@
-# speedflare
+# speedflare ⚡☁️
 
-**Measure your internet speed through Cloudflare's global network with a simple CLI tool.**
+**Measure your internet speed through Cloudflare's global network with a simple CLI tool. 🚀**
 
 <img src=".github/assets/speedflare.gif" alt="demonstration" />
 
-## About
+## About ℹ️
 
 speedflare is a command-line utility inspired by speedtest-go, designed to test your internet connection performance using Cloudflare's extensive server network. It measures latency (with jitter), download, and upload speeds, providing both human-readable and JSON outputs for easy integration with scripts and monitoring tools.
 
-## Highlights
+## Highlights ✨
 
-- **Cloudflare Integration**: Utilizes Cloudflare's globally distributed servers for accurate speed measurements.
-- **Smart Geolocation**: Uses a multi-tiered approach (GeoIP API -> Colo Location -> Country Average) to calculate precise distances to servers.
-- **Routing Analysis**: Automatically detects "fragmented" routing where your ISP might be sending you to a distant Cloudflare server.
-- **Server Selection**: Scans Cloudflare's **IPv4** ranges to find alternative datacenters and allows interactive selection.
-- **Comprehensive Metrics**:
-  - Latency (average, jitter, min, max)
-  - Download/Upload speeds (Mbps)
-  - Data consumed during tests
-- **Protocol Control**: Force IPv4/IPv6-only testing.
-- **JSON Output**: Machine-readable results for automation (`--json`).
+- **🌐 Cloudflare Integration**: Utilizes Cloudflare's globally distributed servers for accurate speed measurements.
+- **📍 Smart Geolocation**: Uses a multi-tiered approach (GeoIP API -> Colo Location -> Country Average) to calculate precise distances to servers.
+- **🛰️ Routing Analysis**: Automatically detects "fragmented" routing where your ISP might be sending you to a distant Cloudflare server.
+- **🎯 Server Selection**: Scans Cloudflare's **IPv4** ranges to find alternative datacenters and allows interactive selection.
+- **📊 Comprehensive Metrics**:
+  - ⏱️ Latency (average, jitter, min, max)
+  - ⚡ Download/Upload speeds (Mbps)
+  - 🧮 Data consumed during tests
+- **🔌 Protocol Control**: Force IPv4/IPv6-only testing.
+- **🤖 JSON Output**: Machine-readable results for automation (`--json`).
 
-## How It Works
+## How It Works 🧠
 
-1. **Trace & Geolocation**: The tool connects to Cloudflare to identify your current Point of Presence (PoP) and queries `api.ipapi.is` to get your approximate coordinates for distance calculations.
-2. **Discovery (IPv4)**: It probes specific Cloudflare IPv4 Anycast ranges to check if other datacenters are reachable from your network.
-3. **Selection**: If multiple datacenters are found (e.g., you are in Russia but routed to Stockholm), the tool presents an interactive list sorted by distance and country preference.
-4. **Measurement**: It performs latency tests followed by parallel download and upload streams.
+1. **🔎 Trace & Geolocation**: The tool connects to Cloudflare to identify your current Point of Presence (PoP) and queries `api.ipapi.is` to get your approximate coordinates for distance calculations.
+2. **🧭 Discovery (IPv4)**: It probes specific Cloudflare IPv4 Anycast ranges to check if other datacenters are reachable from your network.
+3. **🗂️ Selection**: If multiple datacenters are found (e.g., you are in Russia but routed to Stockholm), the tool presents an interactive list sorted by distance and country preference.
+4. **📈 Measurement**: It performs latency tests followed by parallel download and upload streams.
 
-## Installation
+## Installation 🛠️
 
-### Prebuilt Binaries, Linux snippet
+### Prebuilt Binaries (Linux) 📦
 
 ```bash
 ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/;s/arm.*/arm/;s/i.86/i386/')
-curl -Lo speedflare "https://github.com/idanyas/speedflare/releases/latest/download/speedflare_linux_${ARCH}"
+curl -Lo speedflare "https://github.com/mydearniko/speedflare/releases/latest/download/speedflare_linux_${ARCH}"
 chmod +x speedflare && sudo mv speedflare /usr/local/bin/
 ```
 
-### Via Go Install
+### Via Go Install 🧰
 
 ```bash
-go install github.com/idanyas/speedflare@latest
+go install github.com/mydearniko/speedflare@latest
 ```
 
-### Build from Source
+### Build from Source 🏗️
 
 1. Ensure Go 1.20+ is installed.
 2. Clone the repository:
    ```bash
-   git clone https://github.com/idanyas/speedflare.git
+   git clone https://github.com/mydearniko/speedflare.git
    cd speedflare
    ```
 3. Build and install:
@@ -57,7 +57,7 @@ go install github.com/idanyas/speedflare@latest
    go build -o speedflare ./cmd/speedflare/main.go
    ```
 
-## Usage
+## Usage ▶️
 
 ```bash
 # Basic speed test
@@ -74,7 +74,7 @@ go install github.com/idanyas/speedflare@latest
 ./speedflare --latency-attempts 15
 ```
 
-### Command-Line Options
+### Command-Line Options 🧾
 
 ```
   -j, --json              Output results in JSON format.
@@ -88,11 +88,7 @@ go install github.com/idanyas/speedflare@latest
       --hide-ip           Hide the IP address in output.
 ```
 
-## Privacy & External Services
+## Privacy & External Services 🔒
 
-- **Speed Test**: Traffic is generated directly between your machine and `speed.cloudflare.com`.
-- **Geolocation**: A single GET request is made to `https://api.ipapi.is` to determine your latitude/longitude for distance calculations. No personal data is stored by the tool.
-
----
-
-_Created by [idanya](https://idanya.ru). Report issues or contribute on [GitHub](https://github.com/idanyas/speedflare)._
+- **🚦 Speed Test**: Traffic is generated directly between your machine and `speed.cloudflare.com`.
+- **🗺️ Geolocation**: A single GET request is made to `https://api.ipapi.is` to determine your latitude/longitude for distance calculations. No personal data is stored by the tool.
