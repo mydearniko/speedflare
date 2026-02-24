@@ -19,18 +19,40 @@ import (
 	"github.com/idanyas/speedflare/internal/data"
 )
 
-var probeRanges = []string{
+var defaultProbeRanges = []string{
 	"162.159.128.0/19",
 	"104.16.176.0/20",
 	"172.66.40.0/21",
 	"172.67.176.0/20",
 	"188.114.97.0/24",
+	"198.41.192.0/21",
+	"198.41.200.0/21",
+}
+
+var probe198Ranges = []string{
+	"198.41.192.0/21",
+	"198.41.200.0/21",
 }
 
 const (
-	probeCountPerRange = 255
-	earthRadiusKm      = 6371.0
+	defaultProbeCountPerRange = 255
+	probe198CountPerRange     = 765
+	earthRadiusKm             = 6371.0
 )
+
+var probeRanges = append([]string(nil), defaultProbeRanges...)
+var probeCountPerRange = defaultProbeCountPerRange
+
+func SetProbeRanges198Only(only198 bool) {
+	if only198 {
+		probeRanges = append([]string(nil), probe198Ranges...)
+		probeCountPerRange = probe198CountPerRange
+		return
+	}
+
+	probeRanges = append([]string(nil), defaultProbeRanges...)
+	probeCountPerRange = defaultProbeCountPerRange
+}
 
 func GetServerTrace(client *http.Client) (map[string]string, error) {
 	resp, err := client.Get("https://speed.cloudflare.com/cdn-cgi/trace")

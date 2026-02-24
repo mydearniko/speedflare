@@ -27,6 +27,7 @@ var (
 	workers          = pflag.IntP("workers", "w", 6, "Number of workers for multithreaded speedtests.")
 	insecure         = pflag.Bool("insecure", false, "Skip TLS certificate verification (UNSAFE).")
 	hideIP           = pflag.Bool("hide-ip", false, "Hide the IP address in output.")
+	probe198Only     = pflag.Bool("198", false, "Use only 198.41.192.0/21 and 198.41.200.0/21 for datacenter probing.")
 )
 
 func main() {
@@ -77,6 +78,8 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Error: --latency-attempts (-l) must be a positive number.")
 		os.Exit(2)
 	}
+
+	location.SetProbeRanges198Only(*probe198Only)
 
 	output.PrintHeader(*jsonOutput, version)
 

@@ -79,6 +79,7 @@ go install github.com/mydearniko/speedflare@latest
 ```
   -j, --json              Output results in JSON format.
       --list              List all Cloudflare server locations.
+      --198               Use only 198.41.192.0/21 and 198.41.200.0/21 for datacenter probing.
   -4, --ipv4              Use IPv4 only connection.
   -6, --ipv6              Use IPv6 only connection.
   -l, --latency-attempts  Number of latency attempts (default: 10).
