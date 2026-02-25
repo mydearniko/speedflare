@@ -29,6 +29,10 @@ builds:
       - mipsle
       - mips64le
       - loong64
+    ignore:
+      # Go does not support windows/arm (32-bit), and GoReleaser marks it as broken.
+      - goos: windows
+        goarch: arm
     goamd64:
       - v2
     ldflags:
