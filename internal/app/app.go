@@ -31,6 +31,7 @@ const (
 	speedTestLiveDenominatorMin = 500 * time.Millisecond
 	speedTestLiveBlendHorizon   = 2 * time.Second
 	speedTestLiveSmoothingAlpha = 0.35
+	speedTestRetryDelay         = 200 * time.Millisecond
 )
 
 type TestMode uint8
@@ -79,6 +80,30 @@ type liveSpeedEstimator struct {
 	samples  []liveSpeedSample
 	lastMbps float64
 	hasLast  bool
+}
+
+// Throughput tests manage cancellation explicitly, so they must not inherit the
+// generic client-wide deadline used by setup requests.
+func throughputClient(base *http.Client) *http.Client {
+	if base == nil || base.Timeout == 0 {
+		return base
+	}
+
+	clone := *base
+	clone.Timeout = 0
+	return &clone
+}
+
+func waitForRetry(ctx context.Context) bool {
+	timer := time.NewTimer(speedTestRetryDelay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 func newThroughputRecorder(start time.Time, warmup, measure time.Duration) *throughputRecorder {
@@ -393,7 +418,9 @@ func measureLatency(c *http.Client, latencyAttempts int) (*data.LatencyResult, e
 	}, nil
 }
 
-func runTest(name string, worker func(context.Context, *throughputRecorder, *http.Client), client *http.Client, multiple bool, workers int, jsonOutput bool, continuous bool) data.Speed {
+func runTest(name string, worker func(context.Context, *throughputRecorder, *http.Client, bool), client *http.Client, multiple bool, workers int, jsonOutput bool, continuous bool) data.Speed {
+	client = throughputClient(client)
+
 	start := time.Now()
 	measureWindow := speedTestMeasure
 	if continuous {
@@ -436,7 +463,7 @@ func runTest(name string, worker func(context.Context, *throughputRecorder, *htt
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			worker(ctx, recorder, client)
+			worker(ctx, recorder, client, continuous)
 		}()
 	}
 
@@ -487,17 +514,23 @@ func runTest(name string, worker func(context.Context, *throughputRecorder, *htt
 	}
 }
 
-func downloadWorker(ctx context.Context, recorder *throughputRecorder, client *http.Client) {
+func downloadWorker(ctx context.Context, recorder *throughputRecorder, client *http.Client, continuous bool) {
 	buf := make([]byte, 256*1024)
 	for ctx.Err() == nil {
 		req, _ := http.NewRequestWithContext(ctx, "GET", "https://speed.cloudflare.com/__down?bytes=2147483648", nil)
 		resp, err := client.Do(req)
 		if err != nil {
+			if continuous && waitForRetry(ctx) {
+				continue
+			}
 			return
 		}
 
 		if resp.StatusCode >= http.StatusBadRequest {
 			resp.Body.Close()
+			if continuous && waitForRetry(ctx) {
+				continue
+			}
 			return
 		}
 
@@ -517,6 +550,8 @@ func downloadWorker(ctx context.Context, recorder *throughputRecorder, client *h
 			}
 			if errors.Is(err, io.EOF) {
 				shouldRestart = true
+			} else if continuous {
+				shouldRestart = waitForRetry(ctx)
 			}
 			break
 		}
@@ -527,7 +562,7 @@ func downloadWorker(ctx context.Context, recorder *throughputRecorder, client *h
 	}
 }
 
-func uploadWorker(ctx context.Context, recorder *throughputRecorder, client *http.Client) {
+func uploadWorker(ctx context.Context, recorder *throughputRecorder, client *http.Client, continuous bool) {
 	for ctx.Err() == nil {
 		req, _ := http.NewRequest("POST", "https://speed.cloudflare.com/__up", newUploadStream(ctx, recorder))
 		req = req.WithContext(ctx)
@@ -535,13 +570,29 @@ func uploadWorker(ctx context.Context, recorder *throughputRecorder, client *htt
 
 		resp, err := client.Do(req)
 		if err != nil {
+			if continuous && waitForRetry(ctx) {
+				continue
+			}
 			return
 		}
 
-		io.Copy(io.Discard, resp.Body)
+		_, err = io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			if continuous && waitForRetry(ctx) {
+				continue
+			}
+			return
+		}
+
 		if resp.StatusCode >= http.StatusBadRequest {
+			if continuous && waitForRetry(ctx) {
+				continue
+			}
 			return
 		}
 	}

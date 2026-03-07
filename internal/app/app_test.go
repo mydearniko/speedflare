@@ -134,6 +134,54 @@ func TestUploadStreamCountsBytesRead(t *testing.T) {
 	}
 }
 
+func TestThroughputClientDisablesClientTimeout(t *testing.T) {
+	transport := &http.Transport{}
+	base := &http.Client{
+		Transport: transport,
+		Timeout:   30 * time.Second,
+	}
+
+	got := throughputClient(base)
+	if got == base {
+		t.Fatalf("expected throughputClient to clone timed client")
+	}
+	if got.Timeout != 0 {
+		t.Fatalf("expected throughput client timeout to be disabled, got %v", got.Timeout)
+	}
+	if got.Transport != transport {
+		t.Fatalf("expected throughput client to reuse transport")
+	}
+	if base.Timeout != 30*time.Second {
+		t.Fatalf("expected base client timeout to remain unchanged, got %v", base.Timeout)
+	}
+}
+
+func TestRunTestPassesTimeoutlessClientToWorker(t *testing.T) {
+	base := &http.Client{
+		Transport: &http.Transport{},
+		Timeout:   30 * time.Second,
+	}
+
+	observedTimeout := make(chan time.Duration, 1)
+	runTest("Upload:", func(ctx context.Context, recorder *throughputRecorder, client *http.Client, continuous bool) {
+		observedTimeout <- client.Timeout
+		recorder.Add(128 * 1024)
+	}, base, false, 1, true, false)
+
+	select {
+	case got := <-observedTimeout:
+		if got != 0 {
+			t.Fatalf("expected worker to receive timeoutless client, got %v", got)
+		}
+	default:
+		t.Fatal("expected worker to observe throughput client")
+	}
+
+	if base.Timeout != 30*time.Second {
+		t.Fatalf("expected base client timeout to remain unchanged, got %v", base.Timeout)
+	}
+}
+
 func TestDownloadWorkerRestartsRequestsUntilContextCanceled(t *testing.T) {
 	recorder := newThroughputRecorder(time.Now(), 0, 0)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -157,7 +205,7 @@ func TestDownloadWorkerRestartsRequestsUntilContextCanceled(t *testing.T) {
 		}),
 	}
 
-	downloadWorker(ctx, recorder, client)
+	downloadWorker(ctx, recorder, client, true)
 
 	if got, want := atomic.LoadInt32(&calls), int32(3); got != want {
 		t.Fatalf("request count mismatch: got %d want %d", got, want)
@@ -197,12 +245,78 @@ func TestUploadWorkerRestartsRequestsUntilContextCanceled(t *testing.T) {
 		}),
 	}
 
-	uploadWorker(ctx, recorder, client)
+	uploadWorker(ctx, recorder, client, true)
 
 	if got, want := atomic.LoadInt32(&calls), int32(3); got != want {
 		t.Fatalf("request count mismatch: got %d want %d", got, want)
 	}
 	if got, want := atomic.LoadInt64(&recorder.totalBytes), int64(3*chunkSize); got != want {
 		t.Fatalf("total bytes mismatch: got %d want %d", got, want)
+	}
+}
+
+func TestUploadWorkerRetriesDoErrorsInContinuousMode(t *testing.T) {
+	recorder := newThroughputRecorder(time.Now(), 0, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var calls int32
+	client := &http.Client{
+		Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			call := atomic.AddInt32(&calls, 1)
+			if call == 1 {
+				return nil, io.ErrUnexpectedEOF
+			}
+			cancel()
+			req.Body.Close()
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(bytes.NewReader(nil)),
+				Header:     make(http.Header),
+				Request:    req,
+			}, nil
+		}),
+	}
+
+	uploadWorker(ctx, recorder, client, true)
+
+	if got, want := atomic.LoadInt32(&calls), int32(2); got != want {
+		t.Fatalf("request count mismatch: got %d want %d", got, want)
+	}
+}
+
+func TestUploadWorkerRetriesHTTPFailuresInContinuousMode(t *testing.T) {
+	recorder := newThroughputRecorder(time.Now(), 0, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var calls int32
+	client := &http.Client{
+		Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			call := atomic.AddInt32(&calls, 1)
+			req.Body.Close()
+			if call == 1 {
+				return &http.Response{
+					StatusCode: http.StatusTooManyRequests,
+					Body:       io.NopCloser(bytes.NewReader(nil)),
+					Header:     make(http.Header),
+					Request:    req,
+				}, nil
+			}
+
+			cancel()
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(bytes.NewReader(nil)),
+				Header:     make(http.Header),
+				Request:    req,
+			}, nil
+		}),
+	}
+
+	uploadWorker(ctx, recorder, client, true)
+
+	if got, want := atomic.LoadInt32(&calls), int32(2); got != want {
+		t.Fatalf("request count mismatch: got %d want %d", got, want)
 	}
 }
