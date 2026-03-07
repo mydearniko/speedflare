@@ -22,6 +22,7 @@ var (
 	ipv4             = pflag.BoolP("ipv4", "4", false, "Use IPv4 only connection.")
 	ipv6             = pflag.BoolP("ipv6", "6", false, "Use IPv6 only connection.")
 	interfaceName    = pflag.StringP("interface", "I", "", "Network interface or source IP address to use.")
+	originIP         = pflag.String("origin-ip", "", "Override speed.cloudflare.com with a specific origin IP address.")
 	latencyAttempts  = pflag.IntP("latency-attempts", "l", 10, "Number of latency attempts.")
 	singleConnection = pflag.BoolP("single", "s", false, "Use a single connection instead of multiple.")
 	workers          = pflag.IntP("workers", "w", 6, "Number of workers for multithreaded speedtests.")
@@ -53,6 +54,22 @@ func main() {
 	if *ipv4 && *ipv6 {
 		fmt.Fprintln(os.Stderr, "Error: --ipv4 (-4) and --ipv6 (-6) flags cannot be used together.")
 		os.Exit(2)
+	}
+
+	if *originIP != "" {
+		ip := net.ParseIP(*originIP)
+		if ip == nil {
+			fmt.Fprintf(os.Stderr, "Error: --origin-ip must be a valid IP address, got %q.\n", *originIP)
+			os.Exit(2)
+		}
+		if *ipv4 && ip.To4() == nil {
+			fmt.Fprintln(os.Stderr, "Error: --origin-ip must be an IPv4 address when --ipv4 (-4) is used.")
+			os.Exit(2)
+		}
+		if *ipv6 && ip.To4() != nil {
+			fmt.Fprintln(os.Stderr, "Error: --origin-ip must be an IPv6 address when --ipv6 (-6) is used.")
+			os.Exit(2)
+		}
 	}
 
 	effectiveInterfaceName := *interfaceName
@@ -89,7 +106,8 @@ func main() {
 	}
 
 	// Initial Client Creation (for trace and location fetching)
-	httpClient, err := client.NewHTTPClient(*ipv4, *ipv6, effectiveInterfaceName, *insecure, "")
+	selectedOriginIP := *originIP
+	httpClient, err := client.NewHTTPClient(*ipv4, *ipv6, effectiveInterfaceName, *insecure, selectedOriginIP)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating HTTP client: %v\n", err)
 		handleClientError(err, effectiveInterfaceName)
@@ -124,10 +142,9 @@ func main() {
 	}
 
 	// 3. Probe for Fragmentation
-	forcedIP := ""
 	suppressIntro := false
 
-	if !*ipv6 {
+	if !*ipv6 && selectedOriginIP == "" {
 		// Pass Coordinates + Trace Colo + Trace Country + Locations Lib
 		servers, err := location.ProbeColos(userLat, userLon, trace["colo"], trace["loc"], locs)
 		if err == nil && len(servers) > 1 {
@@ -137,10 +154,10 @@ func main() {
 
 				idx := output.SelectServer(servers)
 				selected := servers[idx]
-				forcedIP = selected.IP
+				selectedOriginIP = selected.IP
 
 				// Re-create client with forced IP
-				httpClient, err = client.NewHTTPClient(*ipv4, *ipv6, effectiveInterfaceName, *insecure, forcedIP)
+				httpClient, err = client.NewHTTPClient(*ipv4, *ipv6, effectiveInterfaceName, *insecure, selectedOriginIP)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error creating client for selected colo: %v\n", err)
 					os.Exit(1)

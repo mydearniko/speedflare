@@ -24,6 +24,11 @@ type BrowserTransport struct {
 	Transport *http.Transport
 }
 
+type dialTarget struct {
+	ip      string
+	network string
+}
+
 func (t *BrowserTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	clone := req.Clone(req.Context())
 
@@ -114,10 +119,59 @@ func getLocalAddr(interfaceOrIP string, ipv4Only, ipv6Only bool) (net.Addr, erro
 	return &net.TCPAddr{IP: selectedIP, Port: 0}, nil
 }
 
+func buildOriginDialTarget(originIP string, localAddr net.Addr, ipv4Only, ipv6Only bool) (*dialTarget, error) {
+	if originIP == "" {
+		return nil, nil
+	}
+
+	targetIP := net.ParseIP(originIP)
+	if targetIP == nil {
+		return nil, fmt.Errorf("invalid origin IP: %s", originIP)
+	}
+
+	isIPv4 := targetIP.To4() != nil
+	if ipv4Only && !isIPv4 {
+		return nil, fmt.Errorf("origin IP %s is not IPv4, but --ipv4 flag was specified", originIP)
+	}
+	if ipv6Only && isIPv4 {
+		return nil, fmt.Errorf("origin IP %s is not IPv6, but --ipv6 flag was specified", originIP)
+	}
+
+	if tcpAddr, ok := localAddr.(*net.TCPAddr); ok && tcpAddr.IP != nil {
+		localIsIPv4 := tcpAddr.IP.To4() != nil
+		if localIsIPv4 != isIPv4 {
+			localFamily := "IPv6"
+			targetFamily := "IPv6"
+			if localIsIPv4 {
+				localFamily = "IPv4"
+			}
+			if isIPv4 {
+				targetFamily = "IPv4"
+			}
+			return nil, fmt.Errorf("cannot use %s origin IP %s with bound %s source address %s", targetFamily, originIP, localFamily, tcpAddr.IP.String())
+		}
+	}
+
+	network := "tcp6"
+	if isIPv4 {
+		network = "tcp4"
+	}
+
+	return &dialTarget{
+		ip:      targetIP.String(),
+		network: network,
+	}, nil
+}
+
 // NewHTTPClient creates a new HTTP client.
-// forcedIP argument allows binding to a specific destination IP (ignoring DNS), used for colo selection.
-func NewHTTPClient(ipv4OnlyFlag, ipv6OnlyFlag bool, interfaceOrIP string, insecureSkipVerify bool, forcedIP string) (*http.Client, error) {
+// originIP allows binding to a specific destination IP (ignoring DNS).
+func NewHTTPClient(ipv4OnlyFlag, ipv6OnlyFlag bool, interfaceOrIP string, insecureSkipVerify bool, originIP string) (*http.Client, error) {
 	localAddr, err := getLocalAddr(interfaceOrIP, ipv4OnlyFlag, ipv6OnlyFlag)
+	if err != nil {
+		return nil, err
+	}
+
+	originDialTarget, err := buildOriginDialTarget(originIP, localAddr, ipv4OnlyFlag, ipv6OnlyFlag)
 	if err != nil {
 		return nil, err
 	}
@@ -147,27 +201,14 @@ func NewHTTPClient(ipv4OnlyFlag, ipv6OnlyFlag bool, interfaceOrIP string, insecu
 	transport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			// Forced IP Logic
-			if forcedIP != "" {
+			// Explicit origin IP override: bypass DNS for speed.cloudflare.com.
+			if originDialTarget != nil {
 				_, port, err := net.SplitHostPort(addr)
 				if err != nil {
 					return nil, fmt.Errorf("invalid address format: %w", err)
 				}
 
-				targetIP := net.ParseIP(forcedIP)
-				if targetIP == nil {
-					return nil, fmt.Errorf("invalid forced IP: %s", forcedIP)
-				}
-
-				// If forcedIP is IPv4, force tcp4. If IPv6, force tcp6.
-				networkType := "tcp"
-				if targetIP.To4() != nil {
-					networkType = "tcp4"
-				} else {
-					networkType = "tcp6"
-				}
-
-				return dialer.DialContext(ctx, networkType, net.JoinHostPort(forcedIP, port))
+				return dialer.DialContext(ctx, originDialTarget.network, net.JoinHostPort(originDialTarget.ip, port))
 			}
 
 			// Standard Logic

@@ -72,6 +72,10 @@ go install github.com/mydearniko/speedflare@latest
 
 # Custom latency attempts (default: 10)
 ./speedflare --latency-attempts 15
+
+# Use a specific Cloudflare origin IP
+# Note: automatic colo discovery/selection is skipped when this is set
+./speedflare --origin-ip 104.16.177.1
 ```
 
 ### Command-Line Options 🧾
@@ -82,6 +86,7 @@ go install github.com/mydearniko/speedflare@latest
       --198               Use only 198.41.192.0/21 and 198.41.200.0/21 for datacenter probing.
   -4, --ipv4              Use IPv4 only connection.
   -6, --ipv6              Use IPv6 only connection.
+      --origin-ip         Override speed.cloudflare.com with a specific origin IP address.
   -l, --latency-attempts  Number of latency attempts (default: 10).
   -s, --single            Use a single connection instead of multiple.
   -w, --workers           Number of workers for multithreaded speedtests (default: 6).
