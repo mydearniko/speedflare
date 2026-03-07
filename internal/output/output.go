@@ -108,22 +108,29 @@ func PrintClientInfo(trace map[string]string, jsonOutput bool, hideIP bool) {
 	fmt.Printf("%s Your IP: %s [%s]%s\n", cyan("✓"), ipStr, trace["loc"], warpStatus)
 }
 
+func formatServerLine(server data.Server) string {
+	line := fmt.Sprintf("Server: %s, %s (%s) [%.4f, %.4f]",
+		server.City,
+		server.Country,
+		server.IATA,
+		server.Lat,
+		server.Lon,
+	)
+	if server.IP != "" {
+		line += fmt.Sprintf(" [%s]", server.IP)
+	}
+	return line
+}
+
 func PrintConnectionInfo(trace map[string]string, server data.Server, jsonOutput bool, hideIP bool) {
 	if jsonOutput {
 		return
 	}
 	PrintClientInfo(trace, jsonOutput, hideIP)
-	
+
 	if server.IATA != "" {
 		cyan := color.New(color.FgCyan).SprintFunc()
-		fmt.Printf("%s Server: %s, %s (%s) [%.4f, %.4f]\n\n",
-			cyan("✓"),
-			server.City,
-			server.Country,
-			server.IATA,
-			server.Lat,
-			server.Lon,
-		)
+		fmt.Printf("%s %s\n\n", cyan("✓"), formatServerLine(server))
 	} else {
 		fmt.Println()
 	}
@@ -161,7 +168,7 @@ func SelectServer(servers []data.Server) int {
 		Size:         10,
 		HideHelp:     true,
 		Stdout:       os.Stdout,
-		HideSelected: true, 
+		HideSelected: true,
 	}
 
 	i, _, err := prompt.Run()
@@ -177,14 +184,7 @@ func SelectServer(servers []data.Server) int {
 
 	green := color.New(color.FgGreen).SprintFunc()
 	s := servers[i]
-	fmt.Printf("%s Server: %s, %s (%s) [%.4f, %.4f]\n",
-		green("✓"),
-		s.City,
-		s.Country,
-		s.IATA,
-		s.Lat,
-		s.Lon,
-	)
+	fmt.Printf("%s %s\n", green("✓"), formatServerLine(s))
 
 	return i
 }

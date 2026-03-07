@@ -19,7 +19,7 @@ import (
 	"github.com/idanyas/speedflare/internal/output"
 )
 
-func RunSpeedTest(client *http.Client, latencyAttempts int, workers int, singleConnection bool, jsonOutput bool, suppressIntro bool, hideIP bool) (*data.TestResult, error) {
+func RunSpeedTest(client *http.Client, latencyAttempts int, workers int, singleConnection bool, jsonOutput bool, suppressIntro bool, hideIP bool, originIP string) (*data.TestResult, error) {
 	trace, err := location.GetServerTrace(client)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get server info: %w", err)
@@ -34,6 +34,7 @@ func RunSpeedTest(client *http.Client, latencyAttempts int, workers int, singleC
 	if err != nil {
 		return nil, err
 	}
+	server.IP = originIP
 
 	if !suppressIntro {
 		output.PrintConnectionInfo(trace, server, jsonOutput, hideIP)

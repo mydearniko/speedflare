@@ -170,7 +170,7 @@ func main() {
 	}
 
 	// Run the speed test
-	results, err := app.RunSpeedTest(httpClient, *latencyAttempts, *workers, *singleConnection, *jsonOutput, suppressIntro, *hideIP)
+	results, err := app.RunSpeedTest(httpClient, *latencyAttempts, *workers, *singleConnection, *jsonOutput, suppressIntro, *hideIP, selectedOriginIP)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error during speed test: %v\n", err)
 		handleClientError(err, effectiveInterfaceName)
