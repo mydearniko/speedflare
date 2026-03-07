@@ -22,14 +22,55 @@ var (
 	ipv4             = pflag.BoolP("ipv4", "4", false, "Use IPv4 only connection.")
 	ipv6             = pflag.BoolP("ipv6", "6", false, "Use IPv6 only connection.")
 	interfaceName    = pflag.StringP("interface", "I", "", "Network interface or source IP address to use.")
-	originIP         = pflag.String("origin-ip", "", "Override speed.cloudflare.com with a specific origin IP address.")
+	originIP         = pflag.StringP("origin-ip", "O", "", "Override speed.cloudflare.com with a specific origin IP address.")
 	latencyAttempts  = pflag.IntP("latency-attempts", "l", 10, "Number of latency attempts.")
 	singleConnection = pflag.BoolP("single", "s", false, "Use a single connection instead of multiple.")
+	uploadOnly       = pflag.BoolP("upload-only", "U", false, "Run only the upload test.")
+	downloadOnly     = pflag.BoolP("download-only", "D", false, "Run only the download test.")
+	latencyOnly      = pflag.BoolP("latency-only", "L", false, "Run only the latency test.")
+	continuous       = pflag.BoolP("continuous", "C", false, "Run upload-only or download-only continuously until interrupted.")
 	workers          = pflag.IntP("workers", "w", 6, "Number of workers for multithreaded speedtests.")
 	insecure         = pflag.Bool("insecure", false, "Skip TLS certificate verification (UNSAFE).")
 	hideIP           = pflag.Bool("hide-ip", false, "Hide the IP address in output.")
 	probe198Only     = pflag.Bool("198", false, "Use only 198.41.192.0/21 and 198.41.200.0/21 for datacenter probing.")
 )
+
+func resolveTestMode(upload, download, latency bool) (app.TestMode, error) {
+	selected := 0
+	if upload {
+		selected++
+	}
+	if download {
+		selected++
+	}
+	if latency {
+		selected++
+	}
+	if selected > 1 {
+		return app.TestModeDefault, fmt.Errorf("--upload-only (-U), --download-only (-D), and --latency-only (-L) are mutually exclusive")
+	}
+
+	switch {
+	case upload:
+		return app.TestModeUploadOnly, nil
+	case download:
+		return app.TestModeDownloadOnly, nil
+	case latency:
+		return app.TestModeLatencyOnly, nil
+	default:
+		return app.TestModeDefault, nil
+	}
+}
+
+func validateContinuousFlag(mode app.TestMode, enabled bool) error {
+	if !enabled {
+		return nil
+	}
+	if mode != app.TestModeUploadOnly && mode != app.TestModeDownloadOnly {
+		return fmt.Errorf("--continuous (-C) requires --upload-only (-U) or --download-only (-D)")
+	}
+	return nil
+}
 
 func main() {
 	pflag.Usage = func() {
@@ -53,6 +94,16 @@ func main() {
 
 	if *ipv4 && *ipv6 {
 		fmt.Fprintln(os.Stderr, "Error: --ipv4 (-4) and --ipv6 (-6) flags cannot be used together.")
+		os.Exit(2)
+	}
+
+	mode, err := resolveTestMode(*uploadOnly, *downloadOnly, *latencyOnly)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v.\n", err)
+		os.Exit(2)
+	}
+	if err := validateContinuousFlag(mode, *continuous); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v.\n", err)
 		os.Exit(2)
 	}
 
@@ -170,7 +221,17 @@ func main() {
 	}
 
 	// Run the speed test
-	results, err := app.RunSpeedTest(httpClient, *latencyAttempts, *workers, *singleConnection, *jsonOutput, suppressIntro, *hideIP, selectedOriginIP)
+	results, err := app.RunSpeedTest(httpClient, app.RunOptions{
+		LatencyAttempts:  *latencyAttempts,
+		Workers:          *workers,
+		SingleConnection: *singleConnection,
+		JSONOutput:       *jsonOutput,
+		SuppressIntro:    suppressIntro,
+		HideIP:           *hideIP,
+		OriginIP:         selectedOriginIP,
+		Mode:             mode,
+		Continuous:       *continuous,
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error during speed test: %v\n", err)
 		handleClientError(err, effectiveInterfaceName)

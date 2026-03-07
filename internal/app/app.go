@@ -7,8 +7,12 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
+	"os"
+	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/fatih/color"
@@ -28,6 +32,27 @@ const (
 	speedTestLiveBlendHorizon   = 2 * time.Second
 	speedTestLiveSmoothingAlpha = 0.35
 )
+
+type TestMode uint8
+
+const (
+	TestModeDefault TestMode = iota
+	TestModeUploadOnly
+	TestModeDownloadOnly
+	TestModeLatencyOnly
+)
+
+type RunOptions struct {
+	LatencyAttempts  int
+	Workers          int
+	SingleConnection bool
+	JSONOutput       bool
+	SuppressIntro    bool
+	HideIP           bool
+	OriginIP         string
+	Mode             TestMode
+	Continuous       bool
+}
 
 type throughputRecorder struct {
 	start         time.Time
@@ -89,9 +114,11 @@ func (r *throughputRecorder) Add(n int) {
 		return
 	}
 
-	measurementEndNs := measurementStartNs + r.measure.Nanoseconds()
-	if elapsedNs > measurementEndNs {
-		return
+	if r.measure > 0 {
+		measurementEndNs := measurementStartNs + r.measure.Nanoseconds()
+		if elapsedNs > measurementEndNs {
+			return
+		}
 	}
 
 	atomic.AddInt64(&r.measuredBytes, int64(n))
@@ -131,9 +158,11 @@ func (r *throughputRecorder) measuredDuration(now time.Time) time.Duration {
 		return 0
 	}
 
-	measurementEndNs := measurementStartNs + r.measure.Nanoseconds()
-	if elapsedNs > measurementEndNs {
-		elapsedNs = measurementEndNs
+	if r.measure > 0 {
+		measurementEndNs := measurementStartNs + r.measure.Nanoseconds()
+		if elapsedNs > measurementEndNs {
+			elapsedNs = measurementEndNs
+		}
 	}
 
 	return time.Duration(elapsedNs - measurementStartNs)
@@ -231,7 +260,19 @@ func (e *liveSpeedEstimator) rollingMbps(now time.Time, totalBytes int64) (float
 	return mbps, true
 }
 
-func RunSpeedTest(client *http.Client, latencyAttempts int, workers int, singleConnection bool, jsonOutput bool, suppressIntro bool, hideIP bool, originIP string) (*data.TestResult, error) {
+func (m TestMode) runsLatency() bool {
+	return m == TestModeDefault || m == TestModeLatencyOnly
+}
+
+func (m TestMode) runsDownload() bool {
+	return m == TestModeDefault || m == TestModeDownloadOnly
+}
+
+func (m TestMode) runsUpload() bool {
+	return m == TestModeDefault || m == TestModeUploadOnly
+}
+
+func RunSpeedTest(client *http.Client, opts RunOptions) (*data.TestResult, error) {
 	trace, err := location.GetServerTrace(client)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get server info: %w", err)
@@ -246,44 +287,48 @@ func RunSpeedTest(client *http.Client, latencyAttempts int, workers int, singleC
 	if err != nil {
 		return nil, err
 	}
-	server.IP = originIP
+	server.IP = opts.OriginIP
 
-	if !suppressIntro {
-		output.PrintConnectionInfo(trace, server, jsonOutput, hideIP)
+	if !opts.SuppressIntro {
+		output.PrintConnectionInfo(trace, server, opts.JSONOutput, opts.HideIP)
 	}
-
-	latency, err := measureLatency(client, latencyAttempts)
-	if err != nil {
-		return nil, fmt.Errorf("latency test failed: %w", err)
-	}
-	output.PrintLatencyInfo(latency, jsonOutput)
-
-	download := runTest("Download:", downloadWorker, client, !singleConnection, workers, jsonOutput)
-	upload := runTest("Upload:", uploadWorker, client, !singleConnection, workers, jsonOutput)
 
 	resultIP := trace["ip"]
-	if hideIP {
+	if opts.HideIP {
 		resultIP = "---"
 	}
 
-	return &data.TestResult{
+	result := &data.TestResult{
 		IP:     resultIP,
 		Server: server,
-		Latency: data.Stats{
+	}
+
+	if opts.Mode.runsLatency() {
+		latency, err := measureLatency(client, opts.LatencyAttempts)
+		if err != nil {
+			return nil, fmt.Errorf("latency test failed: %w", err)
+		}
+		output.PrintLatencyInfo(latency, opts.JSONOutput)
+		result.Latency = data.Stats{
 			Value:  latency.Avg,
 			Jitter: latency.Jitter,
 			Min:    latency.Min,
 			Max:    latency.Max,
-		},
-		Download: data.Speed{
-			Mbps:   download.mbps,
-			DataMB: download.dataMB,
-		},
-		Upload: data.Speed{
-			Mbps:   upload.mbps,
-			DataMB: upload.dataMB,
-		},
-	}, nil
+		}
+	}
+
+	if opts.Mode == TestModeLatencyOnly {
+		return result, nil
+	}
+
+	if opts.Mode.runsDownload() {
+		result.Download = runTest("Download:", downloadWorker, client, !opts.SingleConnection, opts.Workers, opts.JSONOutput, opts.Continuous)
+	}
+	if opts.Mode.runsUpload() {
+		result.Upload = runTest("Upload:", uploadWorker, client, !opts.SingleConnection, opts.Workers, opts.JSONOutput, opts.Continuous)
+	}
+
+	return result, nil
 }
 
 func measureLatency(c *http.Client, latencyAttempts int) (*data.LatencyResult, error) {
@@ -348,17 +393,34 @@ func measureLatency(c *http.Client, latencyAttempts int) (*data.LatencyResult, e
 	}, nil
 }
 
-type testResult struct {
-	mbps   float64
-	dataMB float64
-}
-
-func runTest(name string, worker func(context.Context, *throughputRecorder, *http.Client), client *http.Client, multiple bool, workers int, jsonOutput bool) testResult {
+func runTest(name string, worker func(context.Context, *throughputRecorder, *http.Client), client *http.Client, multiple bool, workers int, jsonOutput bool, continuous bool) data.Speed {
 	start := time.Now()
-	recorder := newThroughputRecorder(start, speedTestWarmup, speedTestMeasure)
+	measureWindow := speedTestMeasure
+	if continuous {
+		measureWindow = 0
+	}
+	recorder := newThroughputRecorder(start, speedTestWarmup, measureWindow)
 	liveEstimator := newLiveSpeedEstimator(recorder)
 
-	ctx, cancel := context.WithTimeout(context.Background(), speedTestHardTimeout)
+	parentCtx := context.Background()
+	var stopSignals context.CancelFunc
+	if continuous {
+		parentCtx, stopSignals = signal.NotifyContext(parentCtx, os.Interrupt, syscall.SIGTERM)
+		defer stopSignals()
+		if !jsonOutput {
+			fmt.Printf("Press Ctrl-C to stop %s\n", strings.TrimSuffix(strings.ToLower(name), ":"))
+		}
+	}
+
+	var (
+		ctx    context.Context
+		cancel context.CancelFunc
+	)
+	if continuous {
+		ctx, cancel = context.WithCancel(parentCtx)
+	} else {
+		ctx, cancel = context.WithTimeout(parentCtx, speedTestHardTimeout)
+	}
 	defer cancel()
 
 	done := make(chan struct{})
@@ -377,22 +439,24 @@ func runTest(name string, worker func(context.Context, *throughputRecorder, *htt
 		}()
 	}
 
-	go func() {
-		select {
-		case <-ctx.Done():
-			return
-		case <-recorder.firstByteCh:
-		}
+	if !continuous {
+		go func() {
+			select {
+			case <-ctx.Done():
+				return
+			case <-recorder.firstByteCh:
+			}
 
-		timer := time.NewTimer(speedTestWarmup + speedTestMeasure)
-		defer timer.Stop()
+			timer := time.NewTimer(speedTestWarmup + speedTestMeasure)
+			defer timer.Stop()
 
-		select {
-		case <-ctx.Done():
-		case <-timer.C:
-			cancel()
-		}
-	}()
+			select {
+			case <-ctx.Done():
+			case <-timer.C:
+				cancel()
+			}
+		}()
+	}
 
 	go func() {
 		wg.Wait()
@@ -416,7 +480,10 @@ func runTest(name string, worker func(context.Context, *throughputRecorder, *htt
 		)
 	}
 
-	return testResult{summary.mbps, summary.dataMB}
+	return data.Speed{
+		Mbps:   summary.mbps,
+		DataMB: summary.dataMB,
+	}
 }
 
 func downloadWorker(ctx context.Context, recorder *throughputRecorder, client *http.Client) {

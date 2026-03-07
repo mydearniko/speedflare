@@ -76,6 +76,15 @@ go install github.com/mydearniko/speedflare@latest
 # Use a specific Cloudflare origin IP
 # Note: automatic colo discovery/selection is skipped when this is set
 ./speedflare --origin-ip 104.16.177.1
+
+# Download-only test
+./speedflare --download-only
+
+# Upload-only continuous test until interrupted
+./speedflare --upload-only --continuous
+
+# Latency-only test
+./speedflare --latency-only
 ```
 
 ### Command-Line Options 🧾
@@ -86,9 +95,13 @@ go install github.com/mydearniko/speedflare@latest
       --198               Use only 198.41.192.0/21 and 198.41.200.0/21 for datacenter probing.
   -4, --ipv4              Use IPv4 only connection.
   -6, --ipv6              Use IPv6 only connection.
-      --origin-ip         Override speed.cloudflare.com with a specific origin IP address.
+  -O, --origin-ip         Override speed.cloudflare.com with a specific origin IP address.
   -l, --latency-attempts  Number of latency attempts (default: 10).
   -s, --single            Use a single connection instead of multiple.
+  -U, --upload-only       Run only the upload test.
+  -D, --download-only     Run only the download test.
+  -L, --latency-only      Run only the latency test.
+  -C, --continuous        Run upload-only or download-only continuously until interrupted.
   -w, --workers           Number of workers for multithreaded speedtests (default: 6).
       --insecure          Skip TLS certificate verification (UNSAFE).
       --hide-ip           Hide the IP address in output.

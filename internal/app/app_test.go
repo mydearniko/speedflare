@@ -41,6 +41,27 @@ func TestThroughputRecorderFallsBackBeforeWarmupCompletes(t *testing.T) {
 	}
 }
 
+func TestThroughputRecorderUnlimitedMeasureKeepsAccumulating(t *testing.T) {
+	recorder := newThroughputRecorder(time.Now(), 20*time.Millisecond, 0)
+
+	recorder.Add(1000)
+	time.Sleep(30 * time.Millisecond)
+	recorder.Add(4000)
+	time.Sleep(50 * time.Millisecond)
+	recorder.Add(6000)
+
+	if got, want := atomic.LoadInt64(&recorder.totalBytes), int64(11000); got != want {
+		t.Fatalf("total bytes mismatch: got %d want %d", got, want)
+	}
+	if got, want := atomic.LoadInt64(&recorder.measuredBytes), int64(10000); got != want {
+		t.Fatalf("measured bytes mismatch: got %d want %d", got, want)
+	}
+
+	if got := recorder.measuredDuration(time.Now()); got < 50*time.Millisecond {
+		t.Fatalf("expected measured duration to keep growing in continuous mode, got %v", got)
+	}
+}
+
 func TestLiveSpeedEstimatorReturnsImmediateNumericEstimate(t *testing.T) {
 	now := time.Now()
 	recorder := &throughputRecorder{
