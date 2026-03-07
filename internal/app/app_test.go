@@ -1,11 +1,20 @@
 package app
 
 import (
+	"bytes"
 	"context"
+	"io"
+	"net/http"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
 
 func TestThroughputRecorderSeparatesWarmupFromMeasuredBytes(t *testing.T) {
 	recorder := newThroughputRecorder(time.Now(), 40*time.Millisecond, 120*time.Millisecond)
@@ -122,5 +131,78 @@ func TestUploadStreamCountsBytesRead(t *testing.T) {
 	}
 	if got, want := atomic.LoadInt64(&recorder.measuredBytes), int64(len(buf)); got != want {
 		t.Fatalf("measured bytes mismatch: got %d want %d", got, want)
+	}
+}
+
+func TestDownloadWorkerRestartsRequestsUntilContextCanceled(t *testing.T) {
+	recorder := newThroughputRecorder(time.Now(), 0, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	payload := bytes.Repeat([]byte("d"), 32*1024)
+	var calls int32
+	client := &http.Client{
+		Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			call := atomic.AddInt32(&calls, 1)
+			if call == 3 {
+				cancel()
+			}
+
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(bytes.NewReader(payload)),
+				Header:     make(http.Header),
+				Request:    req,
+			}, nil
+		}),
+	}
+
+	downloadWorker(ctx, recorder, client)
+
+	if got, want := atomic.LoadInt32(&calls), int32(3); got != want {
+		t.Fatalf("request count mismatch: got %d want %d", got, want)
+	}
+	if got, want := atomic.LoadInt64(&recorder.totalBytes), int64(3*len(payload)); got != want {
+		t.Fatalf("total bytes mismatch: got %d want %d", got, want)
+	}
+}
+
+func TestUploadWorkerRestartsRequestsUntilContextCanceled(t *testing.T) {
+	recorder := newThroughputRecorder(time.Now(), 0, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	chunkSize := 32 * 1024
+	var calls int32
+	client := &http.Client{
+		Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			call := atomic.AddInt32(&calls, 1)
+
+			buf := make([]byte, chunkSize)
+			if _, err := io.ReadFull(req.Body, buf); err != nil {
+				return nil, err
+			}
+			req.Body.Close()
+
+			if call == 3 {
+				cancel()
+			}
+
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(bytes.NewReader(nil)),
+				Header:     make(http.Header),
+				Request:    req,
+			}, nil
+		}),
+	}
+
+	uploadWorker(ctx, recorder, client)
+
+	if got, want := atomic.LoadInt32(&calls), int32(3); got != want {
+		t.Fatalf("request count mismatch: got %d want %d", got, want)
+	}
+	if got, want := atomic.LoadInt64(&recorder.totalBytes), int64(3*chunkSize); got != want {
+		t.Fatalf("total bytes mismatch: got %d want %d", got, want)
 	}
 }

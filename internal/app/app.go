@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -9,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -408,7 +408,8 @@ func runTest(name string, worker func(context.Context, *throughputRecorder, *htt
 		parentCtx, stopSignals = signal.NotifyContext(parentCtx, os.Interrupt, syscall.SIGTERM)
 		defer stopSignals()
 		if !jsonOutput {
-			fmt.Printf("Press Ctrl-C to stop %s\n", strings.TrimSuffix(strings.ToLower(name), ":"))
+			cyan := color.New(color.FgCyan).SprintFunc()
+			fmt.Printf("%s %s running continuously (Ctrl-C to stop)\n", cyan("✓"), name)
 		}
 	}
 
@@ -487,32 +488,62 @@ func runTest(name string, worker func(context.Context, *throughputRecorder, *htt
 }
 
 func downloadWorker(ctx context.Context, recorder *throughputRecorder, client *http.Client) {
-	req, _ := http.NewRequestWithContext(ctx, "GET", "https://speed.cloudflare.com/__down?bytes=2147483648", nil)
-	resp, err := client.Do(req)
-	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
-
 	buf := make([]byte, 256*1024)
-	for {
-		n, err := resp.Body.Read(buf)
-		if n > 0 {
-			recorder.Add(n)
-		}
+	for ctx.Err() == nil {
+		req, _ := http.NewRequestWithContext(ctx, "GET", "https://speed.cloudflare.com/__down?bytes=2147483648", nil)
+		resp, err := client.Do(req)
 		if err != nil {
+			return
+		}
+
+		if resp.StatusCode >= http.StatusBadRequest {
+			resp.Body.Close()
+			return
+		}
+
+		shouldRestart := false
+		for {
+			n, err := resp.Body.Read(buf)
+			if n > 0 {
+				recorder.Add(n)
+			}
+			if err == nil {
+				continue
+			}
+
+			resp.Body.Close()
+			if ctx.Err() != nil {
+				return
+			}
+			if errors.Is(err, io.EOF) {
+				shouldRestart = true
+			}
+			break
+		}
+
+		if !shouldRestart {
 			return
 		}
 	}
 }
 
 func uploadWorker(ctx context.Context, recorder *throughputRecorder, client *http.Client) {
-	req, _ := http.NewRequest("POST", "https://speed.cloudflare.com/__up", newUploadStream(ctx, recorder))
-	req = req.WithContext(ctx)
-	req.Header.Set("Content-Type", "application/octet-stream")
-	_, err := client.Do(req)
-	if err != nil {
-		return
+	for ctx.Err() == nil {
+		req, _ := http.NewRequest("POST", "https://speed.cloudflare.com/__up", newUploadStream(ctx, recorder))
+		req = req.WithContext(ctx)
+		req.Header.Set("Content-Type", "application/octet-stream")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return
+		}
+
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode >= http.StatusBadRequest {
+			return
+		}
 	}
 }
 
