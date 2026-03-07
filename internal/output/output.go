@@ -7,7 +7,6 @@ import (
 	"os"
 	"sort"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/fatih/color"
@@ -208,7 +207,7 @@ func PrintLatencyInfo(latency *data.LatencyResult, jsonOutput bool) {
 	)
 }
 
-func ProgressReporter(name string, done <-chan struct{}, totalBytes *int64, start time.Time, jsonOutput bool) {
+func ProgressReporter(name string, done <-chan struct{}, jsonOutput bool, renderStatus func() string) {
 	if jsonOutput {
 		return
 	}
@@ -224,19 +223,10 @@ func ProgressReporter(name string, done <-chan struct{}, totalBytes *int64, star
 		case <-done:
 			return
 		case <-ticker.C:
-			bytes := atomic.LoadInt64(totalBytes)
-			elapsed := time.Since(start).Seconds()
-			var speed float64
-			if elapsed > 0 {
-				speed = (float64(bytes) * 8 / 1e6) / elapsed
-			} else {
-				speed = 0.0
-			}
-
-			fmt.Printf("\r\033[K%s %s %.2f Mbps",
+			fmt.Printf("\r\033[K%s %s %s",
 				cyan(spinner[i%len(spinner)]),
 				name,
-				speed,
+				renderStatus(),
 			)
 			i++
 		}
