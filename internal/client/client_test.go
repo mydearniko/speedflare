@@ -6,11 +6,40 @@ import (
 	"testing"
 )
 
+func TestLocalAddrsResolveNetworkPreferenceDualStackDoesNotForceIPv6(t *testing.T) {
+	addrs := selectInterfaceAddrs([]net.Addr{
+		&net.IPNet{IP: net.ParseIP("2001:db8::10"), Mask: net.CIDRMask(64, 128)},
+		&net.IPNet{IP: net.ParseIP("192.0.2.10"), Mask: net.CIDRMask(24, 32)},
+	}, "warp")
+
+	if !addrs.hasIPv4() || !addrs.hasIPv6() {
+		t.Fatalf("expected dual-stack interface selection, got %+v", addrs)
+	}
+
+	ipv4Only, ipv6Only, networkPreference := addrs.resolveNetworkPreference(false, false)
+	if ipv4Only || ipv6Only {
+		t.Fatalf("expected no forced family for dual-stack interface, got ipv4Only=%v ipv6Only=%v", ipv4Only, ipv6Only)
+	}
+	if networkPreference != "tcp" {
+		t.Fatalf("unexpected network preference: got %q want %q", networkPreference, "tcp")
+	}
+
+	v4 := addrs.addrForIP(net.ParseIP("198.51.100.20"))
+	if v4 == nil || v4.IP.String() != "192.0.2.10" {
+		t.Fatalf("unexpected IPv4 source address: got %+v", v4)
+	}
+
+	v6 := addrs.addrForIP(net.ParseIP("2001:db8::20"))
+	if v6 == nil || v6.IP.String() != "2001:db8::10" {
+		t.Fatalf("unexpected IPv6 source address: got %+v", v6)
+	}
+}
+
 func TestBuildOriginDialTarget(t *testing.T) {
 	tests := []struct {
 		name      string
 		originIP  string
-		localAddr net.Addr
+		localAddr *localAddrs
 		ipv4Only  bool
 		ipv6Only  bool
 		wantNil   bool
@@ -42,10 +71,32 @@ func TestBuildOriginDialTarget(t *testing.T) {
 		{
 			name:     "source family mismatch",
 			originIP: "1.1.1.1",
-			localAddr: &net.TCPAddr{
-				IP: net.ParseIP("2001:db8::10"),
+			localAddr: &localAddrs{
+				ipv6: &net.TCPAddr{
+					IP: net.ParseIP("2001:db8::10"),
+				},
 			},
 			wantErr: "bound IPv6 source address",
+		},
+		{
+			name:     "dual stack binding supports ipv4 origin",
+			originIP: "1.1.1.1",
+			localAddr: &localAddrs{
+				ipv4: &net.TCPAddr{IP: net.ParseIP("192.0.2.10")},
+				ipv6: &net.TCPAddr{IP: net.ParseIP("2001:db8::10")},
+			},
+			wantIP:  "1.1.1.1",
+			wantNet: "tcp4",
+		},
+		{
+			name:     "dual stack binding supports ipv6 origin",
+			originIP: "2606:4700:4700::1111",
+			localAddr: &localAddrs{
+				ipv4: &net.TCPAddr{IP: net.ParseIP("192.0.2.10")},
+				ipv6: &net.TCPAddr{IP: net.ParseIP("2001:db8::10")},
+			},
+			wantIP:  "2606:4700:4700::1111",
+			wantNet: "tcp6",
 		},
 		{
 			name:     "ipv4 success",

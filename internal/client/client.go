@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gwatts/rootcerts"
@@ -29,6 +30,12 @@ type dialTarget struct {
 	network string
 }
 
+type localAddrs struct {
+	interfaceName string
+	ipv4          *net.TCPAddr
+	ipv6          *net.TCPAddr
+}
+
 func (t *BrowserTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	clone := req.Clone(req.Context())
 
@@ -43,7 +50,132 @@ func (t *BrowserTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	return t.Transport.RoundTrip(clone)
 }
 
-func getLocalAddr(interfaceOrIP string, ipv4Only, ipv6Only bool) (net.Addr, error) {
+func (l *localAddrs) hasIPv4() bool {
+	return l != nil && l.ipv4 != nil && l.ipv4.IP != nil
+}
+
+func (l *localAddrs) hasIPv6() bool {
+	return l != nil && l.ipv6 != nil && l.ipv6.IP != nil
+}
+
+func (l *localAddrs) hasAny() bool {
+	return l.hasIPv4() || l.hasIPv6()
+}
+
+func (l *localAddrs) singleAddr() *net.TCPAddr {
+	switch {
+	case l == nil:
+		return nil
+	case l.hasIPv4() && !l.hasIPv6():
+		return l.ipv4
+	case l.hasIPv6() && !l.hasIPv4():
+		return l.ipv6
+	default:
+		return nil
+	}
+}
+
+func (l *localAddrs) addrForIP(ip net.IP) *net.TCPAddr {
+	if l == nil || ip == nil {
+		return nil
+	}
+	if ip.To4() != nil {
+		return l.ipv4
+	}
+	return l.ipv6
+}
+
+func (l *localAddrs) resolveNetworkPreference(ipv4Only, ipv6Only bool) (bool, bool, string) {
+	currentIpv4Only := ipv4Only
+	currentIpv6Only := ipv6Only
+	networkPreference := "tcp"
+
+	switch {
+	case currentIpv4Only:
+		networkPreference = "tcp4"
+	case currentIpv6Only:
+		networkPreference = "tcp6"
+	case l == nil:
+		// No local binding requested; allow both families.
+	case l.hasIPv4() && !l.hasIPv6():
+		currentIpv4Only = true
+		networkPreference = "tcp4"
+	case l.hasIPv6() && !l.hasIPv4():
+		currentIpv6Only = true
+		networkPreference = "tcp6"
+	}
+
+	return currentIpv4Only, currentIpv6Only, networkPreference
+}
+
+func sourceFamilyMismatchError(targetIP net.IP, localAddr *net.TCPAddr) error {
+	if targetIP == nil || localAddr == nil || localAddr.IP == nil {
+		return nil
+	}
+
+	targetIsIPv4 := targetIP.To4() != nil
+	localIsIPv4 := localAddr.IP.To4() != nil
+	if targetIsIPv4 == localIsIPv4 {
+		return nil
+	}
+
+	localFamily := "IPv6"
+	targetFamily := "IPv6"
+	if localIsIPv4 {
+		localFamily = "IPv4"
+	}
+	if targetIsIPv4 {
+		targetFamily = "IPv4"
+	}
+
+	return fmt.Errorf("cannot use %s origin IP %s with bound %s source address %s", targetFamily, targetIP.String(), localFamily, localAddr.IP.String())
+}
+
+func extractIP(addr net.Addr) net.IP {
+	switch v := addr.(type) {
+	case *net.IPNet:
+		return v.IP
+	case *net.IPAddr:
+		return v.IP
+	default:
+		return nil
+	}
+}
+
+func selectInterfaceAddrs(addrs []net.Addr, ifaceName string) *localAddrs {
+	selected := &localAddrs{interfaceName: ifaceName}
+
+	for _, addr := range addrs {
+		ip := extractIP(addr)
+		if ip == nil || ip.IsLoopback() || ip.IsUnspecified() {
+			continue
+		}
+
+		if ipv4 := ip.To4(); ipv4 != nil {
+			if !selected.hasIPv4() {
+				selected.ipv4 = &net.TCPAddr{IP: ipv4, Port: 0}
+			}
+			continue
+		}
+
+		candidate := &net.TCPAddr{IP: ip, Port: 0}
+		if ip.IsLinkLocalUnicast() {
+			candidate.Zone = ifaceName
+			if !selected.hasIPv6() {
+				selected.ipv6 = candidate
+			}
+			continue
+		}
+
+		if !selected.hasIPv6() || selected.ipv6.IP.IsLinkLocalUnicast() {
+			selected.ipv6 = candidate
+		}
+	}
+
+	return selected
+}
+
+func getLocalAddrs(interfaceOrIP string, ipv4Only, ipv6Only bool) (*localAddrs, error) {
 	if interfaceOrIP == "" {
 		return nil, nil
 	}
@@ -56,7 +188,14 @@ func getLocalAddr(interfaceOrIP string, ipv4Only, ipv6Only bool) (net.Addr, erro
 		if ipv6Only && isIPv4 {
 			return nil, fmt.Errorf("provided IP %s is not IPv6, but --ipv6 flag was specified", interfaceOrIP)
 		}
-		return &net.TCPAddr{IP: ip, Port: 0}, nil
+
+		selected := &localAddrs{}
+		if isIPv4 {
+			selected.ipv4 = &net.TCPAddr{IP: ip.To4(), Port: 0}
+		} else {
+			selected.ipv6 = &net.TCPAddr{IP: ip, Port: 0}
+		}
+		return selected, nil
 	}
 
 	iface, err := net.InterfaceByName(interfaceOrIP)
@@ -69,57 +208,27 @@ func getLocalAddr(interfaceOrIP string, ipv4Only, ipv6Only bool) (net.Addr, erro
 		return nil, fmt.Errorf("failed to get addresses for interface %q: %w", interfaceOrIP, err)
 	}
 
-	var selectedIP net.IP
-	for _, addr := range addrs {
-		ipNet, ok := addr.(*net.IPNet)
-		if !ok {
-			continue
-		}
-		ip := ipNet.IP
-		if ip.IsLoopback() || ip.IsUnspecified() {
-			continue
-		}
-		isIPv4 := ip.To4() != nil
-		isIPv6 := !isIPv4
+	selected := selectInterfaceAddrs(addrs, iface.Name)
 
-		if ipv4Only && isIPv4 {
-			selectedIP = ip
-			break
-		} else if ipv6Only && isIPv6 {
-			if !ip.IsLinkLocalUnicast() {
-				selectedIP = ip
-				break
-			} else if selectedIP == nil {
-				selectedIP = ip
-			}
-		} else if !ipv4Only && !ipv6Only {
-			if isIPv6 && !ip.IsLinkLocalUnicast() {
-				selectedIP = ip
-				break
-			} else if isIPv4 {
-				if selectedIP == nil || (selectedIP.IsLinkLocalUnicast()) {
-					selectedIP = ip
-				}
-			} else if isIPv6 && ip.IsLinkLocalUnicast() && selectedIP == nil {
-				selectedIP = ip
-			}
+	switch {
+	case ipv4Only:
+		if !selected.hasIPv4() {
+			return nil, fmt.Errorf("no suitable IPv4 IP address found for interface %q", interfaceOrIP)
 		}
+		return &localAddrs{interfaceName: selected.interfaceName, ipv4: selected.ipv4}, nil
+	case ipv6Only:
+		if !selected.hasIPv6() {
+			return nil, fmt.Errorf("no suitable IPv6 IP address found for interface %q", interfaceOrIP)
+		}
+		return &localAddrs{interfaceName: selected.interfaceName, ipv6: selected.ipv6}, nil
+	case !selected.hasAny():
+		return nil, fmt.Errorf("no suitable IP address found for interface %q", interfaceOrIP)
+	default:
+		return selected, nil
 	}
-
-	if selectedIP == nil {
-		family := "any"
-		if ipv4Only {
-			family = "IPv4"
-		} else if ipv6Only {
-			family = "IPv6"
-		}
-		return nil, fmt.Errorf("no suitable %s IP address found for interface %q", family, interfaceOrIP)
-	}
-
-	return &net.TCPAddr{IP: selectedIP, Port: 0}, nil
 }
 
-func buildOriginDialTarget(originIP string, localAddr net.Addr, ipv4Only, ipv6Only bool) (*dialTarget, error) {
+func buildOriginDialTarget(originIP string, localAddrs *localAddrs, ipv4Only, ipv6Only bool) (*dialTarget, error) {
 	if originIP == "" {
 		return nil, nil
 	}
@@ -137,18 +246,9 @@ func buildOriginDialTarget(originIP string, localAddr net.Addr, ipv4Only, ipv6On
 		return nil, fmt.Errorf("origin IP %s is not IPv6, but --ipv6 flag was specified", originIP)
 	}
 
-	if tcpAddr, ok := localAddr.(*net.TCPAddr); ok && tcpAddr.IP != nil {
-		localIsIPv4 := tcpAddr.IP.To4() != nil
-		if localIsIPv4 != isIPv4 {
-			localFamily := "IPv6"
-			targetFamily := "IPv6"
-			if localIsIPv4 {
-				localFamily = "IPv4"
-			}
-			if isIPv4 {
-				targetFamily = "IPv4"
-			}
-			return nil, fmt.Errorf("cannot use %s origin IP %s with bound %s source address %s", targetFamily, originIP, localFamily, tcpAddr.IP.String())
+	if tcpAddr := localAddrs.singleAddr(); tcpAddr != nil {
+		if err := sourceFamilyMismatchError(targetIP, tcpAddr); err != nil {
+			return nil, err
 		}
 	}
 
@@ -166,20 +266,19 @@ func buildOriginDialTarget(originIP string, localAddr net.Addr, ipv4Only, ipv6On
 // NewHTTPClient creates a new HTTP client.
 // originIP allows binding to a specific destination IP (ignoring DNS).
 func NewHTTPClient(ipv4OnlyFlag, ipv6OnlyFlag bool, interfaceOrIP string, insecureSkipVerify bool, originIP string) (*http.Client, error) {
-	localAddr, err := getLocalAddr(interfaceOrIP, ipv4OnlyFlag, ipv6OnlyFlag)
+	localAddrs, err := getLocalAddrs(interfaceOrIP, ipv4OnlyFlag, ipv6OnlyFlag)
 	if err != nil {
 		return nil, err
 	}
 
-	originDialTarget, err := buildOriginDialTarget(originIP, localAddr, ipv4OnlyFlag, ipv6OnlyFlag)
+	originDialTarget, err := buildOriginDialTarget(originIP, localAddrs, ipv4OnlyFlag, ipv6OnlyFlag)
 	if err != nil {
 		return nil, err
 	}
 
-	dialer := &net.Dialer{
+	baseDialer := &net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
-		LocalAddr: localAddr,
 	}
 
 	tlsClientConfig := &tls.Config{
@@ -201,6 +300,17 @@ func NewHTTPClient(ipv4OnlyFlag, ipv6OnlyFlag bool, interfaceOrIP string, insecu
 	transport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialWithLocalAddr := func(ctx context.Context, network, addr string, localAddr net.Addr) (net.Conn, error) {
+				dialer := *baseDialer
+				dialer.LocalAddr = localAddr
+				if localAddrs != nil && localAddrs.interfaceName != "" {
+					dialer.Control = func(network, address string, c syscall.RawConn) error {
+						return bindSocketToDevice(network, address, localAddrs.interfaceName, c)
+					}
+				}
+				return dialer.DialContext(ctx, network, addr)
+			}
+
 			// Explicit origin IP override: bypass DNS for speed.cloudflare.com.
 			if originDialTarget != nil {
 				_, port, err := net.SplitHostPort(addr)
@@ -208,37 +318,17 @@ func NewHTTPClient(ipv4OnlyFlag, ipv6OnlyFlag bool, interfaceOrIP string, insecu
 					return nil, fmt.Errorf("invalid address format: %w", err)
 				}
 
-				return dialer.DialContext(ctx, originDialTarget.network, net.JoinHostPort(originDialTarget.ip, port))
+				targetIP := net.ParseIP(originDialTarget.ip)
+				localAddr := localAddrs.addrForIP(targetIP)
+				if localAddrs != nil && localAddrs.hasAny() && localAddr == nil {
+					return nil, fmt.Errorf("cannot use origin IP %s with the requested source binding", originDialTarget.ip)
+				}
+
+				return dialWithLocalAddr(ctx, originDialTarget.network, net.JoinHostPort(originDialTarget.ip, port), localAddr)
 			}
 
 			// Standard Logic
-			currentIpv4Only := ipv4OnlyFlag
-			currentIpv6Only := ipv6OnlyFlag
-
-			networkPreference := "tcp"
-			if currentIpv4Only {
-				networkPreference = "tcp4"
-			} else if currentIpv6Only {
-				networkPreference = "tcp6"
-			}
-
-			if tcpAddr, ok := dialer.LocalAddr.(*net.TCPAddr); ok && tcpAddr.IP != nil {
-				if tcpAddr.IP.To4() != nil {
-					if currentIpv6Only {
-						return nil, fmt.Errorf("cannot bind to IPv4 address %s when --ipv6 is specified", tcpAddr.IP.String())
-					}
-					networkPreference = "tcp4"
-					currentIpv4Only = true
-					currentIpv6Only = false
-				} else {
-					if currentIpv4Only {
-						return nil, fmt.Errorf("cannot bind to IPv6 address %s when --ipv4 is specified", tcpAddr.IP.String())
-					}
-					networkPreference = "tcp6"
-					currentIpv6Only = true
-					currentIpv4Only = false
-				}
-			}
+			currentIpv4Only, currentIpv6Only, networkPreference := localAddrs.resolveNetworkPreference(ipv4OnlyFlag, ipv6OnlyFlag)
 
 			host, port, err := net.SplitHostPort(addr)
 			if err != nil {
@@ -255,7 +345,11 @@ func NewHTTPClient(ipv4OnlyFlag, ipv6OnlyFlag bool, interfaceOrIP string, insecu
 				if (networkPreference == "tcp4" && !isIPv4) || (networkPreference == "tcp6" && isIPv4) {
 					return nil, fmt.Errorf("target IP address %s does not match required network type %s", host, networkPreference)
 				}
-				conn, dialErr := dialer.DialContext(ctx, currentNetworkType, net.JoinHostPort(ip.String(), port))
+				localAddr := localAddrs.addrForIP(ip)
+				if localAddrs != nil && localAddrs.hasAny() && localAddr == nil {
+					return nil, fmt.Errorf("target IP address %s does not match the requested source binding", host)
+				}
+				conn, dialErr := dialWithLocalAddr(ctx, currentNetworkType, net.JoinHostPort(ip.String(), port), localAddr)
 				if dialErr != nil {
 					// Error handling logic
 					return nil, dialErr
@@ -287,9 +381,14 @@ func NewHTTPClient(ipv4OnlyFlag, ipv6OnlyFlag bool, interfaceOrIP string, insecu
 					continue
 				}
 
+				localAddr := localAddrs.addrForIP(ip)
+				if localAddrs != nil && localAddrs.hasAny() && localAddr == nil {
+					continue
+				}
+
 				// Implement per-IP timeout to prevent one blackholed IP from stalling the entire process
 				dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-				conn, dialErr := dialer.DialContext(dialCtx, currentNetworkType, net.JoinHostPort(ipStr, port))
+				conn, dialErr := dialWithLocalAddr(dialCtx, currentNetworkType, net.JoinHostPort(ipStr, port), localAddr)
 				cancel()
 
 				if dialErr == nil {
