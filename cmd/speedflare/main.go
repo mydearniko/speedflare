@@ -189,7 +189,7 @@ func main() {
 	if geoErr != nil && !*jsonOutput {
 		// Log warning but continue to fallback logic
 		yellow := color.New(color.FgYellow).FprintfFunc()
-		yellow(os.Stderr, "Warning: GeoIP lookup failed (%v). Falling back to Cloudflare estimated location.\n", geoErr)
+		yellow(os.Stderr, "Warning: GeoIP lookup failed (%v). Falling back to Cloudflare country estimate.\n", geoErr)
 	}
 
 	// 3. Probe for Fragmentation

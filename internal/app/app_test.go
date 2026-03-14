@@ -27,10 +27,10 @@ func TestThroughputRecorderSeparatesWarmupFromMeasuredBytes(t *testing.T) {
 	time.Sleep(140 * time.Millisecond)
 	recorder.Add(8000)
 
-	if got, want := atomic.LoadInt64(&recorder.totalBytes), int64(19000); got != want {
+	if got, want := recorder.totalBytes.Load(), int64(19000); got != want {
 		t.Fatalf("total bytes mismatch: got %d want %d", got, want)
 	}
-	if got, want := atomic.LoadInt64(&recorder.measuredBytes), int64(10000); got != want {
+	if got, want := recorder.measuredBytes.Load(), int64(10000); got != want {
 		t.Fatalf("measured bytes mismatch: got %d want %d", got, want)
 	}
 }
@@ -59,10 +59,10 @@ func TestThroughputRecorderUnlimitedMeasureKeepsAccumulating(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	recorder.Add(6000)
 
-	if got, want := atomic.LoadInt64(&recorder.totalBytes), int64(11000); got != want {
+	if got, want := recorder.totalBytes.Load(), int64(11000); got != want {
 		t.Fatalf("total bytes mismatch: got %d want %d", got, want)
 	}
-	if got, want := atomic.LoadInt64(&recorder.measuredBytes), int64(10000); got != want {
+	if got, want := recorder.measuredBytes.Load(), int64(10000); got != want {
 		t.Fatalf("measured bytes mismatch: got %d want %d", got, want)
 	}
 
@@ -77,10 +77,10 @@ func TestLiveSpeedEstimatorReturnsImmediateNumericEstimate(t *testing.T) {
 		start:       now.Add(-700 * time.Millisecond),
 		warmup:      speedTestWarmup,
 		measure:     speedTestMeasure,
-		firstByteNs: 0,
 		firstByteCh: make(chan struct{}),
 	}
-	atomic.StoreInt64(&recorder.totalBytes, 12_000_000)
+	recorder.firstByteNs.Store(0)
+	recorder.totalBytes.Store(12_000_000)
 
 	estimator := newLiveSpeedEstimator(recorder)
 	mbps := estimator.current(now)
@@ -95,14 +95,14 @@ func TestLiveSpeedEstimatorUsesRollingWindow(t *testing.T) {
 		start:       now.Add(-2 * time.Second),
 		warmup:      speedTestWarmup,
 		measure:     speedTestMeasure,
-		firstByteNs: 0,
 		firstByteCh: make(chan struct{}),
 	}
 	estimator := newLiveSpeedEstimator(recorder)
 
-	atomic.StoreInt64(&recorder.totalBytes, 10_000_000)
+	recorder.firstByteNs.Store(0)
+	recorder.totalBytes.Store(10_000_000)
 	first := estimator.current(now.Add(-900 * time.Millisecond))
-	atomic.StoreInt64(&recorder.totalBytes, 34_000_000)
+	recorder.totalBytes.Store(34_000_000)
 	second := estimator.current(now)
 
 	if first <= 0 {
@@ -126,10 +126,10 @@ func TestUploadStreamCountsBytesRead(t *testing.T) {
 		t.Fatalf("read length mismatch: got %d want %d", n, len(buf))
 	}
 
-	if got, want := atomic.LoadInt64(&recorder.totalBytes), int64(len(buf)); got != want {
+	if got, want := recorder.totalBytes.Load(), int64(len(buf)); got != want {
 		t.Fatalf("total bytes mismatch: got %d want %d", got, want)
 	}
-	if got, want := atomic.LoadInt64(&recorder.measuredBytes), int64(len(buf)); got != want {
+	if got, want := recorder.measuredBytes.Load(), int64(len(buf)); got != want {
 		t.Fatalf("measured bytes mismatch: got %d want %d", got, want)
 	}
 }
@@ -210,7 +210,7 @@ func TestDownloadWorkerRestartsRequestsUntilContextCanceled(t *testing.T) {
 	if got, want := atomic.LoadInt32(&calls), int32(3); got != want {
 		t.Fatalf("request count mismatch: got %d want %d", got, want)
 	}
-	if got, want := atomic.LoadInt64(&recorder.totalBytes), int64(3*len(payload)); got != want {
+	if got, want := recorder.totalBytes.Load(), int64(3*len(payload)); got != want {
 		t.Fatalf("total bytes mismatch: got %d want %d", got, want)
 	}
 }
@@ -250,7 +250,7 @@ func TestUploadWorkerRestartsRequestsUntilContextCanceled(t *testing.T) {
 	if got, want := atomic.LoadInt32(&calls), int32(3); got != want {
 		t.Fatalf("request count mismatch: got %d want %d", got, want)
 	}
-	if got, want := atomic.LoadInt64(&recorder.totalBytes), int64(3*chunkSize); got != want {
+	if got, want := recorder.totalBytes.Load(), int64(3*chunkSize); got != want {
 		t.Fatalf("total bytes mismatch: got %d want %d", got, want)
 	}
 }

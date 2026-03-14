@@ -105,10 +105,15 @@ func FindServerInfo(iata string, locs []data.Location) (data.Server, error) {
 	return data.Server{}, fmt.Errorf("server location not found")
 }
 
+type serverCandidate struct {
+	server       data.Server
+	sortDistance float64
+}
+
 // ProbeColos determines the closest servers.
-// userLat/userLon: Explicit coordinates from GeoIP (Approach 1).
-// userColo: The 'colo' code from trace (Approach 2/Fallback: use this colo's loc as reference).
-// userCountryCode: The country code (Legacy fallback).
+// userLat/userLon: Explicit coordinates from GeoIP.
+// userColo: The current Cloudflare PoP, used only as a last-resort sorting hint.
+// userCountryCode: Country code from Cloudflare trace.
 func ProbeColos(userLat, userLon float64, userColo string, userCountryCode string, allLocs []data.Location) ([]data.Server, error) {
 	var ips []string
 	for _, cidr := range probeRanges {
@@ -152,58 +157,45 @@ func ProbeColos(userLat, userLon float64, userColo string, userCountryCode strin
 		}
 	}
 
-	// Calculate reference coordinates
-	var refLat, refLon float64
-	var hasReference bool
+	return buildServerChoices(uniqueColos, userLat, userLon, userColo, userCountryCode, allLocs), nil
+}
 
-	// Priority 1: Explicit Coordinates (from GeoIP API)
-	if userLat != 0 || userLon != 0 {
-		refLat = userLat
-		refLon = userLon
-		hasReference = true
-	} else {
-		// Priority 2: Fallback to the Primary Colo location (Using our "library" of locations)
-		// This is much better than hardcoded capitals for large countries (e.g. Vladivostok vs Moscow).
+func buildServerChoices(uniqueColos map[string]string, userLat, userLon float64, userColo string, userCountryCode string, allLocs []data.Location) []data.Server {
+	displayLat, displayLon, hasDisplayReference := resolveDisplayReference(userLat, userLon, userCountryCode, allLocs)
+	sortLat, sortLon, hasSortReference := displayLat, displayLon, hasDisplayReference
+
+	if !hasSortReference {
 		if primaryInfo, err := FindServerInfo(userColo, allLocs); err == nil {
-			refLat = primaryInfo.Lat
-			refLon = primaryInfo.Lon
-			hasReference = true
-		} else {
-			// Priority 3: Centroid of all servers in country (Old logic - worst case fallback)
-			var latSum, lonSum float64
-			var count int
-			for _, l := range allLocs {
-				if l.CCA2 == userCountryCode {
-					latSum += l.Lat
-					lonSum += l.Lon
-					count++
-				}
-			}
-			if count > 0 {
-				refLat = latSum / float64(count)
-				refLon = lonSum / float64(count)
-				hasReference = true
-			}
+			sortLat = primaryInfo.Lat
+			sortLon = primaryInfo.Lon
+			hasSortReference = true
 		}
 	}
 
-	var servers []data.Server
+	var candidates []serverCandidate
 	for colo, ip := range uniqueColos {
 		info, err := FindServerInfo(colo, allLocs)
 		if err != nil {
 			continue
 		}
+
 		info.IP = ip
-		if hasReference {
-			info.Distance = haversine(refLat, refLon, info.Lat, info.Lon)
+		if hasDisplayReference {
+			info.Distance = haversine(displayLat, displayLon, info.Lat, info.Lon)
+			info.HasDistance = true
 		}
-		servers = append(servers, info)
+
+		candidate := serverCandidate{server: info}
+		if hasSortReference {
+			candidate.sortDistance = haversine(sortLat, sortLon, info.Lat, info.Lon)
+		}
+		candidates = append(candidates, candidate)
 	}
 
-	sort.Slice(servers, func(i, j int) bool {
+	sort.Slice(candidates, func(i, j int) bool {
 		// Priority 1: Same country as user
-		s1InCountry := servers[i].Country == userCountryCode
-		s2InCountry := servers[j].Country == userCountryCode
+		s1InCountry := candidates[i].server.Country == userCountryCode
+		s2InCountry := candidates[j].server.Country == userCountryCode
 
 		if s1InCountry && !s2InCountry {
 			return true
@@ -213,17 +205,43 @@ func ProbeColos(userLat, userLon float64, userColo string, userCountryCode strin
 		}
 
 		// Priority 2: Distance (if available)
-		if hasReference {
-			if math.Abs(servers[i].Distance-servers[j].Distance) > 1.0 { // tolerance
-				return servers[i].Distance < servers[j].Distance
+		if hasSortReference {
+			if math.Abs(candidates[i].sortDistance-candidates[j].sortDistance) > 1.0 { // tolerance
+				return candidates[i].sortDistance < candidates[j].sortDistance
 			}
 		}
 
 		// Priority 3: Alphabetical IATA
-		return servers[i].IATA < servers[j].IATA
+		return candidates[i].server.IATA < candidates[j].server.IATA
 	})
 
-	return servers, nil
+	servers := make([]data.Server, 0, len(candidates))
+	for _, candidate := range candidates {
+		servers = append(servers, candidate.server)
+	}
+
+	return servers
+}
+
+func resolveDisplayReference(userLat, userLon float64, userCountryCode string, allLocs []data.Location) (float64, float64, bool) {
+	if userLat != 0 || userLon != 0 {
+		return userLat, userLon, true
+	}
+
+	var latSum, lonSum float64
+	var count int
+	for _, loc := range allLocs {
+		if loc.CCA2 == userCountryCode {
+			latSum += loc.Lat
+			lonSum += loc.Lon
+			count++
+		}
+	}
+	if count == 0 {
+		return 0, 0, false
+	}
+
+	return latSum / float64(count), lonSum / float64(count), true
 }
 
 func probeSingleIP(ip string) (string, error) {

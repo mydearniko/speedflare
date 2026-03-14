@@ -56,13 +56,16 @@ type RunOptions struct {
 }
 
 type throughputRecorder struct {
-	start         time.Time
-	warmup        time.Duration
-	measure       time.Duration
-	totalBytes    int64
-	measuredBytes int64
-	firstByteNs   int64
-	firstByteCh   chan struct{}
+	// Typed atomics keep these counters 64-bit aligned on 32-bit ARM/Android,
+	// which avoids "unaligned 64-bit atomic operation" panics in Termux.
+	totalBytes    atomic.Int64
+	measuredBytes atomic.Int64
+	firstByteNs   atomic.Int64
+
+	start       time.Time
+	warmup      time.Duration
+	measure     time.Duration
+	firstByteCh chan struct{}
 }
 
 type throughputSummary struct {
@@ -107,13 +110,14 @@ func waitForRetry(ctx context.Context) bool {
 }
 
 func newThroughputRecorder(start time.Time, warmup, measure time.Duration) *throughputRecorder {
-	return &throughputRecorder{
+	recorder := &throughputRecorder{
 		start:       start,
 		warmup:      warmup,
 		measure:     measure,
-		firstByteNs: -1,
 		firstByteCh: make(chan struct{}),
 	}
+	recorder.firstByteNs.Store(-1)
+	return recorder
 }
 
 func (r *throughputRecorder) Add(n int) {
@@ -121,16 +125,16 @@ func (r *throughputRecorder) Add(n int) {
 		return
 	}
 
-	atomic.AddInt64(&r.totalBytes, int64(n))
+	r.totalBytes.Add(int64(n))
 
 	elapsedNs := time.Since(r.start).Nanoseconds()
-	firstByteNs := atomic.LoadInt64(&r.firstByteNs)
+	firstByteNs := r.firstByteNs.Load()
 	if firstByteNs < 0 {
-		if atomic.CompareAndSwapInt64(&r.firstByteNs, -1, elapsedNs) {
+		if r.firstByteNs.CompareAndSwap(-1, elapsedNs) {
 			close(r.firstByteCh)
 			firstByteNs = elapsedNs
 		} else {
-			firstByteNs = atomic.LoadInt64(&r.firstByteNs)
+			firstByteNs = r.firstByteNs.Load()
 		}
 	}
 
@@ -146,15 +150,15 @@ func (r *throughputRecorder) Add(n int) {
 		}
 	}
 
-	atomic.AddInt64(&r.measuredBytes, int64(n))
+	r.measuredBytes.Add(int64(n))
 }
 
 func (r *throughputRecorder) summarize(now time.Time) throughputSummary {
-	totalBytes := atomic.LoadInt64(&r.totalBytes)
+	totalBytes := r.totalBytes.Load()
 	dataMB := float64(totalBytes) / 1e6
 
 	mbps := 0.0
-	measuredBytes := atomic.LoadInt64(&r.measuredBytes)
+	measuredBytes := r.measuredBytes.Load()
 	measuredDuration := r.measuredDuration(now)
 	if measuredDuration >= 500*time.Millisecond && measuredBytes > 0 {
 		mbps = (float64(measuredBytes) * 8) / (measuredDuration.Seconds() * 1e6)
@@ -172,7 +176,7 @@ func (r *throughputRecorder) summarize(now time.Time) throughputSummary {
 }
 
 func (r *throughputRecorder) measuredDuration(now time.Time) time.Duration {
-	firstByteNs := atomic.LoadInt64(&r.firstByteNs)
+	firstByteNs := r.firstByteNs.Load()
 	if firstByteNs < 0 {
 		return 0
 	}
@@ -194,7 +198,7 @@ func (r *throughputRecorder) measuredDuration(now time.Time) time.Duration {
 }
 
 func (r *throughputRecorder) activeDuration(now time.Time) time.Duration {
-	firstByteNs := atomic.LoadInt64(&r.firstByteNs)
+	firstByteNs := r.firstByteNs.Load()
 	if firstByteNs < 0 {
 		return 0
 	}
@@ -214,7 +218,7 @@ func newLiveSpeedEstimator(recorder *throughputRecorder) *liveSpeedEstimator {
 }
 
 func (e *liveSpeedEstimator) current(now time.Time) float64 {
-	totalBytes := atomic.LoadInt64(&e.recorder.totalBytes)
+	totalBytes := e.recorder.totalBytes.Load()
 	if totalBytes <= 0 {
 		return 0
 	}
@@ -243,7 +247,7 @@ func (e *liveSpeedEstimator) current(now time.Time) float64 {
 	}
 
 	measuredDuration := e.recorder.measuredDuration(now)
-	measuredBytes := atomic.LoadInt64(&e.recorder.measuredBytes)
+	measuredBytes := e.recorder.measuredBytes.Load()
 	if measuredDuration > 0 && measuredBytes > 0 {
 		measuredMbps := (float64(measuredBytes) * 8) / (measuredDuration.Seconds() * 1e6)
 		confidence := measuredDuration.Seconds() / speedTestLiveBlendHorizon.Seconds()

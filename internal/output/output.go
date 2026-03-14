@@ -151,8 +151,8 @@ func SelectServer(servers []data.Server) int {
 
 	// 2. Generate dynamic templates with fixed width padding
 	// Logic: {{ printf "%s," .City | printf "%-Ns" }} adds the comma, then pads to N width
-	activeTpl := fmt.Sprintf(`{{ "▸" | cyan }} {{ printf "%%s," .City | printf "%%-%ds" | cyan }} {{ .Country | cyan }} ({{ .IATA | cyan }}) [{{ .Distance | printf "%%.0f" }} km]{{ if .IP }} [{{ .IP | cyan }}]{{ end }}`, padWidth)
-	inactiveTpl := fmt.Sprintf(`  {{ printf "%%s," .City | printf "%%-%ds" }} {{ .Country }} ({{ .IATA }}) [{{ .Distance | printf "%%.0f" }} km]{{ if .IP }} [{{ .IP }}]{{ end }}`, padWidth)
+	activeTpl := fmt.Sprintf(`{{ "▸" | cyan }} {{ printf "%%s," .City | printf "%%-%ds" | cyan }} {{ .Country | cyan }} ({{ .IATA | cyan }}){{ if .HasDistance }} [{{ .Distance | printf "%%.0f" }} km]{{ end }}{{ if .IP }} [{{ .IP | cyan }}]{{ end }}`, padWidth)
+	inactiveTpl := fmt.Sprintf(`  {{ printf "%%s," .City | printf "%%-%ds" }} {{ .Country }} ({{ .IATA }}){{ if .HasDistance }} [{{ .Distance | printf "%%.0f" }} km]{{ end }}{{ if .IP }} [{{ .IP }}]{{ end }}`, padWidth)
 
 	templates := &promptui.SelectTemplates{
 		Label:    "{{ . }}",

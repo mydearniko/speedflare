@@ -417,6 +417,12 @@ func NewHTTPClient(ipv4OnlyFlag, ipv6OnlyFlag bool, interfaceOrIP string, insecu
 	}, nil
 }
 
+// ResolveHost resolves a hostname using the same DoH/system/direct-DNS fallback chain
+// used by the main HTTP client.
+func ResolveHost(ctx context.Context, host string, ipv4Only, ipv6Only bool, insecureSkipVerify bool, rootCAs *x509.CertPool) ([]net.IP, error) {
+	return resolveHost(ctx, host, ipv4Only, ipv6Only, insecureSkipVerify, rootCAs)
+}
+
 func resolveHost(ctx context.Context, host string, ipv4Only, ipv6Only bool, insecureSkipVerify bool, rootCAs *x509.CertPool) ([]net.IP, error) {
 	var lastErr error
 	var ips []net.IP

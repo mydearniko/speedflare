@@ -11,7 +11,7 @@ speedflare is a command-line utility inspired by speedtest-go, designed to test 
 ## Highlights ✨
 
 - **🌐 Cloudflare Integration**: Utilizes Cloudflare's globally distributed servers for accurate speed measurements.
-- **📍 Smart Geolocation**: Uses a multi-tiered approach (GeoIP API -> Colo Location -> Country Average) to calculate precise distances to servers.
+- **📍 Smart Geolocation**: Uses a multi-tiered approach (GeoIP API -> Country Average -> Colo Hint) to calculate practical distances to servers.
 - **🛰️ Routing Analysis**: Automatically detects "fragmented" routing where your ISP might be sending you to a distant Cloudflare server.
 - **🎯 Server Selection**: Scans Cloudflare's **IPv4** ranges to find alternative datacenters and allows interactive selection.
 - **📊 Comprehensive Metrics**:
