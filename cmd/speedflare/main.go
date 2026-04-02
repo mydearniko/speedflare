@@ -185,7 +185,7 @@ func main() {
 
 	// 2. Resolve User Location
 	// Using a dedicated/clean client logic inside GetUserCoordinates now.
-	userLat, userLon, geoErr := location.GetUserCoordinates()
+	userLat, userLon, geoErr := location.GetUserCoordinates(effectiveInterfaceName)
 	if geoErr != nil && !*jsonOutput {
 		// Log warning but continue to fallback logic
 		yellow := color.New(color.FgYellow).FprintfFunc()

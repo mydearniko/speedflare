@@ -37,7 +37,7 @@ func TestGetUserCoordinatesUsesFallbackResolver(t *testing.T) {
 
 	geoIPEndpoint = "https://geoip.test:" + listenerPort + "/"
 	geoIPAttempts = 1
-	geoIPResolveHost = func(ctx context.Context, host string, rootCAs *x509.CertPool) ([]net.IP, error) {
+	geoIPResolveHost = func(ctx context.Context, host string, rootCAs *x509.CertPool, interfaceName string) ([]net.IP, error) {
 		if host != "geoip.test" {
 			t.Fatalf("unexpected host to resolve: %s", host)
 		}
@@ -53,7 +53,7 @@ func TestGetUserCoordinatesUsesFallbackResolver(t *testing.T) {
 		return &tls.Config{InsecureSkipVerify: true}
 	}
 
-	lat, lon, err := GetUserCoordinates()
+	lat, lon, err := GetUserCoordinates("")
 	if err != nil {
 		t.Fatalf("GetUserCoordinates returned error: %v", err)
 	}

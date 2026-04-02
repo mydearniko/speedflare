@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"slices"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gwatts/rootcerts"
@@ -29,8 +30,8 @@ type ipapiResponse struct {
 var (
 	geoIPEndpoint    = "https://api.ipapi.is/"
 	geoIPAttempts    = 3
-	geoIPResolveHost = func(ctx context.Context, host string, rootCAs *x509.CertPool) ([]net.IP, error) {
-		return client.ResolveHost(ctx, host, false, false, false, rootCAs)
+	geoIPResolveHost = func(ctx context.Context, host string, rootCAs *x509.CertPool, interfaceName string) ([]net.IP, error) {
+		return client.ResolveHost(ctx, host, false, false, false, rootCAs, interfaceName)
 	}
 	geoIPTLSConfig = func(serverName string, rootCAs *x509.CertPool) *tls.Config {
 		return &tls.Config{
@@ -41,7 +42,7 @@ var (
 )
 
 // GetUserCoordinates performs parallel GeoIP requests and returns the first successful result.
-func GetUserCoordinates() (float64, float64, error) {
+func GetUserCoordinates(interfaceName string) (float64, float64, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -50,7 +51,7 @@ func GetUserCoordinates() (float64, float64, error) {
 		return 0, 0, fmt.Errorf("invalid geoip endpoint: %w", err)
 	}
 
-	httpClient, err := newGeoIPHTTPClient(endpoint)
+	httpClient, err := newGeoIPHTTPClient(endpoint, interfaceName)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -118,7 +119,7 @@ func GetUserCoordinates() (float64, float64, error) {
 	}
 }
 
-func newGeoIPHTTPClient(endpoint *url.URL) (*http.Client, error) {
+func newGeoIPHTTPClient(endpoint *url.URL, interfaceName string) (*http.Client, error) {
 	rootCAs := rootcerts.ServerCertPool()
 	if rootCAs == nil {
 		return nil, errors.New("unable to obtain a valid root CA pool for GeoIP lookup")
@@ -128,6 +129,12 @@ func newGeoIPHTTPClient(endpoint *url.URL) (*http.Client, error) {
 	baseDialer := &net.Dialer{
 		Timeout:   5 * time.Second,
 		KeepAlive: 30 * time.Second,
+	}
+
+	if interfaceName != "" {
+		baseDialer.Control = func(network, address string, c syscall.RawConn) error {
+			return client.BindSocketToDevice(network, address, interfaceName, c)
+		}
 	}
 
 	transport := &http.Transport{
@@ -140,7 +147,7 @@ func newGeoIPHTTPClient(endpoint *url.URL) (*http.Client, error) {
 				return nil, fmt.Errorf("invalid address format: %w", err)
 			}
 
-			ips, err := geoIPResolveHost(ctx, host, rootCAs)
+			ips, err := geoIPResolveHost(ctx, host, rootCAs, interfaceName)
 			if err != nil {
 				return nil, fmt.Errorf("DNS resolution failed for %s: %w", host, err)
 			}
