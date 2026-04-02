@@ -14,8 +14,10 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
+	"github.com/idanyas/speedflare/internal/client"
 	"github.com/idanyas/speedflare/internal/data"
 )
 
@@ -114,7 +116,7 @@ type serverCandidate struct {
 // userLat/userLon: Explicit coordinates from GeoIP.
 // userColo: The current Cloudflare PoP, used only as a last-resort sorting hint.
 // userCountryCode: Country code from Cloudflare trace.
-func ProbeColos(userLat, userLon float64, userColo string, userCountryCode string, allLocs []data.Location) ([]data.Server, error) {
+func ProbeColos(userLat, userLon float64, userColo string, userCountryCode string, allLocs []data.Location, interfaceName string) ([]data.Server, error) {
 	var ips []string
 	for _, cidr := range probeRanges {
 		generated, err := generateRandomIPs(cidr, probeCountPerRange)
@@ -140,7 +142,7 @@ func ProbeColos(userLat, userLon float64, userColo string, userCountryCode strin
 			workerLimit <- struct{}{}
 			defer func() { <-workerLimit }()
 
-			colo, err := probeSingleIP(targetIP)
+			colo, err := probeSingleIP(targetIP, interfaceName)
 			if err == nil && colo != "" {
 				results <- probeResult{Colo: colo, IP: targetIP}
 			}
@@ -244,10 +246,16 @@ func resolveDisplayReference(userLat, userLon float64, userCountryCode string, a
 	return latSum / float64(count), lonSum / float64(count), true
 }
 
-func probeSingleIP(ip string) (string, error) {
+func probeSingleIP(ip string, interfaceName string) (string, error) {
 	// Increased timeouts slightly to avoid skipping good servers on jittery lines
 	dialer := &net.Dialer{
 		Timeout: 1500 * time.Millisecond,
+	}
+
+	if interfaceName != "" {
+		dialer.Control = func(network, address string, c syscall.RawConn) error {
+			return client.BindSocketToDevice(network, address, interfaceName, c)
+		}
 	}
 
 	tr := &http.Transport{

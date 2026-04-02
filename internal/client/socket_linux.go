@@ -7,7 +7,7 @@ import (
 	"syscall"
 )
 
-func bindSocketToDevice(network, address, ifaceName string, c syscall.RawConn) error {
+func BindSocketToDevice(network, address, ifaceName string, c syscall.RawConn) error {
 	_ = network
 	_ = address
 

@@ -305,7 +305,7 @@ func NewHTTPClient(ipv4OnlyFlag, ipv6OnlyFlag bool, interfaceOrIP string, insecu
 				dialer.LocalAddr = localAddr
 				if localAddrs != nil && localAddrs.interfaceName != "" {
 					dialer.Control = func(network, address string, c syscall.RawConn) error {
-						return bindSocketToDevice(network, address, localAddrs.interfaceName, c)
+						return BindSocketToDevice(network, address, localAddrs.interfaceName, c)
 					}
 				}
 				return dialer.DialContext(ctx, network, addr)

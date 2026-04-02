@@ -197,7 +197,7 @@ func main() {
 
 	if !*ipv6 && selectedOriginIP == "" {
 		// Pass Coordinates + Trace Colo + Trace Country + Locations Lib
-		servers, err := location.ProbeColos(userLat, userLon, trace["colo"], trace["loc"], locs)
+		servers, err := location.ProbeColos(userLat, userLon, trace["colo"], trace["loc"], locs, effectiveInterfaceName)
 		if err == nil && len(servers) > 1 {
 			// Ask user to choose
 			if !*jsonOutput {
