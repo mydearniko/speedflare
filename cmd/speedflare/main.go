@@ -124,9 +124,6 @@ func main() {
 	}
 
 	effectiveInterfaceName := *interfaceName
-	if ip := net.ParseIP(*interfaceName); ip != nil {
-		effectiveInterfaceName = *interfaceName
-	}
 
 	if *singleConnection {
 		if pflag.CommandLine.Changed("workers") {
@@ -183,19 +180,17 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 2. Resolve User Location
-	// Using a dedicated/clean client logic inside GetUserCoordinates now.
-	userLat, userLon, geoErr := location.GetUserCoordinates(effectiveInterfaceName)
-	if geoErr != nil && !*jsonOutput {
-		// Log warning but continue to fallback logic
-		yellow := color.New(color.FgYellow).FprintfFunc()
-		yellow(os.Stderr, "Warning: GeoIP lookup failed (%v). Falling back to Cloudflare country estimate.\n", geoErr)
-	}
-
-	// 3. Probe for Fragmentation
+	// 2. Probe for Fragmentation
 	suppressIntro := false
 
 	if !*ipv6 && selectedOriginIP == "" {
+		// Resolve User Location (only needed for probing)
+		userLat, userLon, geoErr := location.GetUserCoordinates(effectiveInterfaceName)
+		if geoErr != nil && !*jsonOutput {
+			yellow := color.New(color.FgYellow).FprintfFunc()
+			yellow(os.Stderr, "Warning: GeoIP lookup failed (%v). Falling back to Cloudflare country estimate.\n", geoErr)
+		}
+
 		// Pass Coordinates + Trace Colo + Trace Country + Locations Lib
 		servers, err := location.ProbeColos(userLat, userLon, trace["colo"], trace["loc"], locs, effectiveInterfaceName)
 		if err == nil && len(servers) > 1 {
@@ -235,10 +230,10 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error during speed test: %v\n", err)
 		handleClientError(err, effectiveInterfaceName)
-		if !*insecure && (strings.Contains(err.Error(), "certificate") || strings.Contains(err.Error(), "tls")) {
-			fmt.Fprintln(os.Stderr, "Hint: If you trust the network, try the --insecure flag (use with caution).")
-		} else if strings.Contains(err.Error(), "certificate signed by unknown authority") {
+		if !*insecure && strings.Contains(err.Error(), "certificate signed by unknown authority") {
 			fmt.Fprintln(os.Stderr, "Hint: System's root CA certificates might be missing or outdated.")
+			fmt.Fprintln(os.Stderr, "Hint: If you trust the network, try the --insecure flag (use with caution).")
+		} else if !*insecure && (strings.Contains(err.Error(), "certificate") || strings.Contains(err.Error(), "tls")) {
 			fmt.Fprintln(os.Stderr, "Hint: If you trust the network, try the --insecure flag (use with caution).")
 		}
 		os.Exit(1)

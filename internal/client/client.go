@@ -639,7 +639,10 @@ func resolveWithDoH(ctx context.Context, host string, ipv4Only, ipv6Only bool, i
 				if resp.StatusCode != http.StatusOK {
 					return
 				}
-				body, _ := io.ReadAll(resp.Body)
+				body, err := io.ReadAll(resp.Body)
+				if err != nil {
+					return
+				}
 				response := new(dns.Msg)
 				if err := response.Unpack(body); err != nil {
 					return

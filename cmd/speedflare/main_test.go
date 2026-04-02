@@ -46,6 +46,19 @@ func TestResolveTestMode(t *testing.T) {
 			latency:   true,
 			wantError: true,
 		},
+		{
+			name:      "download and latency conflict",
+			download:  true,
+			latency:   true,
+			wantError: true,
+		},
+		{
+			name:      "all three conflict",
+			upload:    true,
+			download:  true,
+			latency:   true,
+			wantError: true,
+		},
 	}
 
 	for _, tt := range tests {

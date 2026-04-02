@@ -63,7 +63,10 @@ func GetServerTrace(client *http.Client) (map[string]string, error) {
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading trace response: %w", err)
+	}
 	info := make(map[string]string)
 	for _, line := range strings.Split(string(body), "\n") {
 		if parts := strings.SplitN(line, "=", 2); len(parts) == 2 {
@@ -258,9 +261,14 @@ func probeSingleIP(ip string, interfaceName string) (string, error) {
 		}
 	}
 
+	dialNetwork := "tcp4"
+	if parsedIP := net.ParseIP(ip); parsedIP != nil && parsedIP.To4() == nil {
+		dialNetwork = "tcp6"
+	}
+
 	tr := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return dialer.DialContext(ctx, "tcp4", net.JoinHostPort(ip, "443"))
+			return dialer.DialContext(ctx, dialNetwork, net.JoinHostPort(ip, "443"))
 		},
 		TLSHandshakeTimeout: 1500 * time.Millisecond,
 		DisableKeepAlives:   true,
@@ -282,7 +290,10 @@ func probeSingleIP(ip string, interfaceName string) (string, error) {
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	if err != nil {
+		return "", fmt.Errorf("reading probe response: %w", err)
+	}
 	for _, line := range strings.Split(string(body), "\n") {
 		if strings.HasPrefix(line, "colo=") {
 			parts := strings.Split(line, "=")
