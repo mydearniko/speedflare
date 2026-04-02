@@ -18,10 +18,8 @@ func bindSocketToDevice(network, address, ifaceName string, c syscall.RawConn) e
 		return err
 	}
 
-	switch sockErr {
-	case nil, syscall.EPERM, syscall.ENOPROTOOPT:
-		return nil
-	default:
+	if sockErr != nil {
 		return fmt.Errorf("bind to interface %q failed: %w", ifaceName, sockErr)
 	}
+	return nil
 }
