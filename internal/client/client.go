@@ -12,6 +12,8 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -34,6 +36,84 @@ type localAddrs struct {
 	interfaceName string
 	ipv4          *net.TCPAddr
 	ipv6          *net.TCPAddr
+}
+
+func usableResolvedIP(ip net.IP, allowLoopback bool) bool {
+	if ip == nil || ip.IsUnspecified() {
+		return false
+	}
+	return allowLoopback || !ip.IsLoopback()
+}
+
+func parseProxyURL(proxyAddress string) (*url.URL, error) {
+	proxyAddress = strings.TrimSpace(proxyAddress)
+	if proxyAddress == "" {
+		return nil, nil
+	}
+	if !strings.Contains(proxyAddress, "://") {
+		proxyAddress = "http://" + proxyAddress
+	}
+
+	parsed, err := url.Parse(proxyAddress)
+	if err != nil {
+		return nil, fmt.Errorf("invalid proxy URL: %w", err)
+	}
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+
+	switch parsed.Scheme {
+	case "http", "https", "socks5", "socks5h":
+	default:
+		return nil, fmt.Errorf("unsupported proxy scheme %q", parsed.Scheme)
+	}
+	if parsed.Hostname() == "" {
+		return nil, errors.New("proxy URL must include a host")
+	}
+
+	return parsed, nil
+}
+
+func proxyFunc(proxyAddress string) (func(*http.Request) (*url.URL, error), error) {
+	parsed, err := parseProxyURL(proxyAddress)
+	if err != nil {
+		return nil, err
+	}
+	if parsed == nil {
+		return http.ProxyFromEnvironment, nil
+	}
+	return http.ProxyURL(parsed), nil
+}
+
+// EffectiveProxyURL returns the proxy URL that would be used for targetURL.
+// An empty proxyAddress uses the standard HTTP(S)_PROXY/NO_PROXY environment.
+func EffectiveProxyURL(proxyAddress, targetURL string) (*url.URL, error) {
+	proxy, err := proxyFunc(proxyAddress)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, targetURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return proxy(req)
+}
+
+func effectiveProxyDialHost(proxy func(*http.Request) (*url.URL, error), targetURL string) (string, error) {
+	req, err := http.NewRequest(http.MethodGet, targetURL, nil)
+	if err != nil {
+		return "", err
+	}
+
+	proxyURL, err := proxy(req)
+	if err != nil {
+		return "", err
+	}
+	if proxyURL == nil {
+		return "", nil
+	}
+
+	return proxyURL.Hostname(), nil
 }
 
 func (t *BrowserTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -272,8 +352,17 @@ func buildOriginDialTarget(originIP string, localAddrs *localAddrs, ipv4Only, ip
 
 // NewHTTPClient creates a new HTTP client.
 // originIP allows binding to a specific destination IP (ignoring DNS).
-func NewHTTPClient(ipv4OnlyFlag, ipv6OnlyFlag bool, interfaceOrIP string, insecureSkipVerify bool, originIP string) (*http.Client, error) {
+func NewHTTPClient(ipv4OnlyFlag, ipv6OnlyFlag bool, interfaceOrIP string, insecureSkipVerify bool, originIP string, proxyAddress string) (*http.Client, error) {
 	localAddrs, err := getLocalAddrs(interfaceOrIP, ipv4OnlyFlag, ipv6OnlyFlag)
+	if err != nil {
+		return nil, err
+	}
+
+	proxy, err := proxyFunc(proxyAddress)
+	if err != nil {
+		return nil, err
+	}
+	proxyDialHost, err := effectiveProxyDialHost(proxy, "https://speed.cloudflare.com/")
 	if err != nil {
 		return nil, err
 	}
@@ -289,7 +378,6 @@ func NewHTTPClient(ipv4OnlyFlag, ipv6OnlyFlag bool, interfaceOrIP string, insecu
 	}
 
 	tlsClientConfig := &tls.Config{
-		ServerName:         "speed.cloudflare.com",
 		InsecureSkipVerify: insecureSkipVerify,
 	}
 
@@ -305,7 +393,7 @@ func NewHTTPClient(ipv4OnlyFlag, ipv6OnlyFlag bool, interfaceOrIP string, insecu
 	}
 
 	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
+		Proxy: proxy,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			dialWithLocalAddr := func(ctx context.Context, network, addr string, localAddr net.Addr) (net.Conn, error) {
 				dialer := *baseDialer
@@ -364,7 +452,8 @@ func NewHTTPClient(ipv4OnlyFlag, ipv6OnlyFlag bool, interfaceOrIP string, insecu
 				return conn, nil
 			}
 
-			resolvedIPs, resolveErr := resolveHost(ctx, host, currentIpv4Only, currentIpv6Only, insecureSkipVerify, tlsClientConfig.RootCAs, localAddrs.getInterfaceName())
+			allowLoopback := proxyDialHost != "" && strings.EqualFold(host, proxyDialHost)
+			resolvedIPs, resolveErr := resolveHost(ctx, host, currentIpv4Only, currentIpv6Only, insecureSkipVerify, tlsClientConfig.RootCAs, localAddrs.getInterfaceName(), allowLoopback)
 			if resolveErr != nil {
 				return nil, fmt.Errorf("DNS resolution failed for %s: %w", host, resolveErr)
 			}
@@ -427,15 +516,25 @@ func NewHTTPClient(ipv4OnlyFlag, ipv6OnlyFlag bool, interfaceOrIP string, insecu
 // ResolveHost resolves a hostname using the same DoH/system/direct-DNS fallback chain
 // used by the main HTTP client.
 func ResolveHost(ctx context.Context, host string, ipv4Only, ipv6Only bool, insecureSkipVerify bool, rootCAs *x509.CertPool, interfaceName string) ([]net.IP, error) {
-	return resolveHost(ctx, host, ipv4Only, ipv6Only, insecureSkipVerify, rootCAs, interfaceName)
+	return resolveHost(ctx, host, ipv4Only, ipv6Only, insecureSkipVerify, rootCAs, interfaceName, false)
 }
 
-func resolveHost(ctx context.Context, host string, ipv4Only, ipv6Only bool, insecureSkipVerify bool, rootCAs *x509.CertPool, interfaceName string) ([]net.IP, error) {
+func resolveHost(ctx context.Context, host string, ipv4Only, ipv6Only bool, insecureSkipVerify bool, rootCAs *x509.CertPool, interfaceName string, allowLoopback bool) ([]net.IP, error) {
 	var lastErr error
 	var ips []net.IP
 
+	if allowLoopback {
+		ips, err := resolveWithSystem(ctx, host, ipv4Only, ipv6Only, interfaceName, allowLoopback)
+		if err == nil && len(ips) > 0 {
+			return ips, nil
+		}
+		if err != nil {
+			lastErr = fmt.Errorf("system DNS failed: %w", err)
+		}
+	}
+
 	// Attempt 1: DoH
-	ips, err := resolveWithDoH(ctx, host, ipv4Only, ipv6Only, insecureSkipVerify, rootCAs, interfaceName)
+	ips, err := resolveWithDoH(ctx, host, ipv4Only, ipv6Only, insecureSkipVerify, rootCAs, interfaceName, allowLoopback)
 	if err == nil && len(ips) > 0 {
 		return ips, nil
 	}
@@ -444,51 +543,23 @@ func resolveHost(ctx context.Context, host string, ipv4Only, ipv6Only bool, inse
 	}
 
 	// Attempt 2: System Resolver
-	resolver := net.Resolver{}
-	if interfaceName != "" {
-		resolver.Dial = func(ctx context.Context, network, address string) (net.Conn, error) {
-			d := net.Dialer{Timeout: 5 * time.Second}
-			d.Control = func(network, address string, c syscall.RawConn) error {
-				return BindSocketToDevice(network, address, interfaceName, c)
-			}
-			return d.DialContext(ctx, network, address)
+	if !allowLoopback {
+		ips, err := resolveWithSystem(ctx, host, ipv4Only, ipv6Only, interfaceName, allowLoopback)
+		if err == nil && len(ips) > 0 {
+			return ips, nil
 		}
-	}
-	ipAddrs, err := resolver.LookupIPAddr(ctx, host)
-	if err == nil && len(ipAddrs) > 0 {
-		filteredSystemIPs := ipAddrs[:0]
-		for _, ipAddr := range ipAddrs {
-			if ipAddr.IP.IsUnspecified() || ipAddr.IP.IsLoopback() {
-				continue
+		if err != nil {
+			sysDNSErr := fmt.Errorf("system DNS failed: %w", err)
+			if lastErr != nil {
+				lastErr = fmt.Errorf("%w; %w", lastErr, sysDNSErr)
+			} else {
+				lastErr = sysDNSErr
 			}
-			isIPv4 := ipAddr.IP.To4() != nil
-			if ipv4Only && !isIPv4 {
-				continue
-			}
-			if ipv6Only && isIPv4 {
-				continue
-			}
-			filteredSystemIPs = append(filteredSystemIPs, ipAddr)
-		}
-		if len(filteredSystemIPs) > 0 {
-			resultIPs := make([]net.IP, len(filteredSystemIPs))
-			for i, ipa := range filteredSystemIPs {
-				resultIPs[i] = ipa.IP
-			}
-			return resultIPs, nil
-		}
-	}
-	if err != nil {
-		sysDNSErr := fmt.Errorf("system DNS failed: %w", err)
-		if lastErr != nil {
-			lastErr = fmt.Errorf("%w; %w", lastErr, sysDNSErr)
-		} else {
-			lastErr = sysDNSErr
 		}
 	}
 
 	// Attempt 3: Direct DNS
-	ips, err = resolveWithDirectDNS(ctx, host, ipv4Only, ipv6Only, interfaceName)
+	ips, err = resolveWithDirectDNS(ctx, host, ipv4Only, ipv6Only, interfaceName, allowLoopback)
 	if err == nil && len(ips) > 0 {
 		return ips, nil
 	}
@@ -507,7 +578,42 @@ func resolveHost(ctx context.Context, host string, ipv4Only, ipv6Only bool, inse
 	return nil, fmt.Errorf("all resolution methods failed for %s: %w", host, lastErr)
 }
 
-func resolveWithDoH(ctx context.Context, host string, ipv4Only, ipv6Only bool, insecureSkipVerify bool, rootCAs *x509.CertPool, interfaceName string) ([]net.IP, error) {
+func resolveWithSystem(ctx context.Context, host string, ipv4Only, ipv6Only bool, interfaceName string, allowLoopback bool) ([]net.IP, error) {
+	resolver := net.Resolver{}
+	if interfaceName != "" {
+		resolver.Dial = func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 5 * time.Second}
+			d.Control = func(network, address string, c syscall.RawConn) error {
+				return BindSocketToDevice(network, address, interfaceName, c)
+			}
+			return d.DialContext(ctx, network, address)
+		}
+	}
+
+	ipAddrs, err := resolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+
+	ips := make([]net.IP, 0, len(ipAddrs))
+	for _, ipAddr := range ipAddrs {
+		if !usableResolvedIP(ipAddr.IP, allowLoopback) {
+			continue
+		}
+		isIPv4 := ipAddr.IP.To4() != nil
+		if ipv4Only && !isIPv4 {
+			continue
+		}
+		if ipv6Only && isIPv4 {
+			continue
+		}
+		ips = append(ips, ipAddr.IP)
+	}
+
+	return ips, nil
+}
+
+func resolveWithDoH(ctx context.Context, host string, ipv4Only, ipv6Only bool, insecureSkipVerify bool, rootCAs *x509.CertPool, interfaceName string, allowLoopback bool) ([]net.IP, error) {
 	dohServers := []struct {
 		address string
 		sni     string
@@ -657,12 +763,12 @@ func resolveWithDoH(ctx context.Context, host string, ipv4Only, ipv6Only bool, i
 				for _, ans := range response.Answer {
 					switch a := ans.(type) {
 					case *dns.A:
-						if !ipv6Only && currentQType == dns.TypeA && !a.A.IsUnspecified() && !a.A.IsLoopback() {
+						if !ipv6Only && currentQType == dns.TypeA && usableResolvedIP(a.A, allowLoopback) {
 							ips = append(ips, a.A)
 							addedRelevantIP = true
 						}
 					case *dns.AAAA:
-						if !ipv4Only && currentQType == dns.TypeAAAA && !a.AAAA.IsUnspecified() && !a.AAAA.IsLoopback() {
+						if !ipv4Only && currentQType == dns.TypeAAAA && usableResolvedIP(a.AAAA, allowLoopback) {
 							ips = append(ips, a.AAAA)
 							addedRelevantIP = true
 						}
@@ -700,7 +806,7 @@ func resolveWithDoH(ctx context.Context, host string, ipv4Only, ipv6Only bool, i
 	return nil, fmt.Errorf("no usable IPs resolved via DoH")
 }
 
-func resolveWithDirectDNS(ctx context.Context, host string, ipv4Only, ipv6Only bool, interfaceName string) ([]net.IP, error) {
+func resolveWithDirectDNS(ctx context.Context, host string, ipv4Only, ipv6Only bool, interfaceName string, allowLoopback bool) ([]net.IP, error) {
 	servers := []struct {
 		addr string
 		isV4 bool
@@ -780,12 +886,12 @@ func resolveWithDirectDNS(ctx context.Context, host string, ipv4Only, ipv6Only b
 				for _, ans := range response.Answer {
 					switch a := ans.(type) {
 					case *dns.A:
-						if !ipv6Only && currentQType == dns.TypeA && !a.A.IsUnspecified() && !a.A.IsLoopback() {
+						if !ipv6Only && currentQType == dns.TypeA && usableResolvedIP(a.A, allowLoopback) {
 							ips = append(ips, a.A)
 							addedRelevantIP = true
 						}
 					case *dns.AAAA:
-						if !ipv4Only && currentQType == dns.TypeAAAA && !a.AAAA.IsUnspecified() && !a.AAAA.IsLoopback() {
+						if !ipv4Only && currentQType == dns.TypeAAAA && usableResolvedIP(a.AAAA, allowLoopback) {
 							ips = append(ips, a.AAAA)
 							addedRelevantIP = true
 						}

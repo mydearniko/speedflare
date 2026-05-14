@@ -77,6 +77,7 @@ That makes it useful for:
 - **Download and upload throughput**: Supports multi-worker and single-connection tests.
 - **IPv4 and IPv6 control**: Force IPv4-only or IPv6-only tests from the terminal.
 - **Source interface control**: Test from a specific network interface or source IP with `--interface`.
+- **Proxy support**: Route tests through an explicit HTTP, HTTPS, SOCKS5, or SOCKS5H proxy with `--proxy`.
 - **JSON output**: Use `--json` for automation and monitoring integrations.
 - **Targeted test modes**: Run download-only, upload-only, latency-only, or continuous throughput tests.
 - **Privacy option**: Hide your IP address in terminal output with `--hide-ip`.
@@ -101,6 +102,10 @@ speedflare --interface 192.0.2.10
 
 # Use a specific Cloudflare origin IP
 speedflare --origin-ip 104.16.177.1
+
+# Route the test through a proxy
+speedflare --proxy http://127.0.0.1:8080
+speedflare --proxy socks5h://127.0.0.1:1080
 
 # Run only one part of the test
 speedflare --latency-only
@@ -163,6 +168,7 @@ Example output:
   -6, --ipv6              Use IPv6 only connection.
   -I, --interface         Network interface or source IP address to use.
   -O, --origin-ip         Override speed.cloudflare.com with a specific origin IP address.
+      --proxy             Proxy URL for HTTP(S) requests (http, https, socks5, or socks5h).
   -l, --latency-attempts  Number of latency attempts (default: 10).
   -s, --single            Use a single connection instead of multiple.
   -U, --upload-only       Run only the upload test.
@@ -177,7 +183,8 @@ Example output:
 
 ## Privacy and External Services
 
-- **Speed test traffic**: Generated directly between your machine and `speed.cloudflare.com`.
+- **Speed test traffic**: By default, generated directly between your machine and `speed.cloudflare.com`.
+- **Proxy traffic**: When `--proxy` or standard proxy environment variables are configured, HTTP(S) test traffic is routed through that proxy and direct datacenter probing is skipped.
 - **Cloudflare trace and location metadata**: Used to identify the Cloudflare PoP/colo serving your connection.
 - **Geolocation lookup**: speedflare may make a GET request to `https://api.ipapi.is` to estimate latitude and longitude for datacenter distance calculations.
 - **Local storage**: speedflare does not store personal data.

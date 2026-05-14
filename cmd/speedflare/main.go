@@ -23,6 +23,7 @@ var (
 	ipv6             = pflag.BoolP("ipv6", "6", false, "Use IPv6 only connection.")
 	interfaceName    = pflag.StringP("interface", "I", "", "Network interface or source IP address to use.")
 	originIP         = pflag.StringP("origin-ip", "O", "", "Override speed.cloudflare.com with a specific origin IP address.")
+	proxyAddress     = pflag.String("proxy", "", "Proxy URL for HTTP(S) requests (http, https, socks5, or socks5h).")
 	latencyAttempts  = pflag.IntP("latency-attempts", "l", 10, "Number of latency attempts.")
 	singleConnection = pflag.BoolP("single", "s", false, "Use a single connection instead of multiple.")
 	uploadOnly       = pflag.BoolP("upload-only", "U", false, "Run only the upload test.")
@@ -123,6 +124,18 @@ func main() {
 		}
 	}
 
+	effectiveProxyURL, err := client.EffectiveProxyURL(*proxyAddress, "https://speed.cloudflare.com/")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: invalid proxy configuration: %v.\n", err)
+		os.Exit(2)
+	}
+	proxyActive := effectiveProxyURL != nil
+	if proxyActive && *originIP != "" {
+		fmt.Fprintln(os.Stderr, "Error: --origin-ip cannot be used when a proxy is configured.")
+		fmt.Fprintln(os.Stderr, "Hint: Omit --proxy, unset proxy environment variables, or set NO_PROXY for speed.cloudflare.com.")
+		os.Exit(2)
+	}
+
 	effectiveInterfaceName := *interfaceName
 
 	if *singleConnection {
@@ -152,10 +165,14 @@ func main() {
 		yellow := color.New(color.FgYellow).FprintfFunc()
 		yellow(os.Stderr, "Warning: Skipping TLS certificate verification (--insecure). This is potentially unsafe!\n")
 	}
+	if proxyActive && !*jsonOutput && !*list {
+		yellow := color.New(color.FgYellow).FprintfFunc()
+		yellow(os.Stderr, "Warning: Proxy configured; direct datacenter probing will be skipped.\n")
+	}
 
 	// Initial Client Creation (for trace and location fetching)
 	selectedOriginIP := *originIP
-	httpClient, err := client.NewHTTPClient(*ipv4, *ipv6, effectiveInterfaceName, *insecure, selectedOriginIP)
+	httpClient, err := client.NewHTTPClient(*ipv4, *ipv6, effectiveInterfaceName, *insecure, selectedOriginIP, *proxyAddress)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating HTTP client: %v\n", err)
 		handleClientError(err, effectiveInterfaceName)
@@ -183,7 +200,7 @@ func main() {
 	// 2. Probe for Fragmentation
 	suppressIntro := false
 
-	if !*ipv6 && selectedOriginIP == "" {
+	if !*ipv6 && selectedOriginIP == "" && !proxyActive {
 		// Resolve User Location (only needed for probing)
 		userLat, userLon, geoErr := location.GetUserCoordinates(effectiveInterfaceName)
 		if geoErr != nil && !*jsonOutput {
@@ -203,7 +220,7 @@ func main() {
 				selectedOriginIP = selected.IP
 
 				// Re-create client with forced IP
-				httpClient, err = client.NewHTTPClient(*ipv4, *ipv6, effectiveInterfaceName, *insecure, selectedOriginIP)
+				httpClient, err = client.NewHTTPClient(*ipv4, *ipv6, effectiveInterfaceName, *insecure, selectedOriginIP, *proxyAddress)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error creating client for selected colo: %v\n", err)
 					os.Exit(1)
@@ -251,6 +268,8 @@ func handleClientError(err error, iface string) {
 		fmt.Fprintf(os.Stderr, "Hint: Check if interface %q has an IP address matching the requested family (IPv4/IPv6).\n", iface)
 	} else if _, ok := err.(*net.DNSError); ok || strings.Contains(err.Error(), "DNS resolution failed") {
 		fmt.Fprintln(os.Stderr, "Hint: Check network connectivity and DNS settings. Try forcing IPv4 (-4) or IPv6 (-6).")
+	} else if strings.Contains(err.Error(), "proxy") || strings.Contains(err.Error(), "socks") || strings.Contains(err.Error(), "407") {
+		fmt.Fprintln(os.Stderr, "Hint: Check the proxy URL, credentials, and reachability.")
 	} else if strings.Contains(err.Error(), "connection failed") || strings.Contains(err.Error(), "dial tcp") {
 		fmt.Fprintln(os.Stderr, "Hint: Check network connectivity, firewall rules, or try specifying a source IP/interface with -I.")
 	}

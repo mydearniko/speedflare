@@ -1,8 +1,13 @@
 package client
 
 import (
+	"fmt"
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -144,5 +149,159 @@ func TestBuildOriginDialTarget(t *testing.T) {
 				t.Fatalf("network mismatch: got %q want %q", target.network, tt.wantNet)
 			}
 		})
+	}
+}
+
+func TestParseProxyURL(t *testing.T) {
+	tests := []struct {
+		name       string
+		input      string
+		wantNil    bool
+		wantScheme string
+		wantHost   string
+		wantErr    string
+	}{
+		{
+			name:    "empty",
+			wantNil: true,
+		},
+		{
+			name:       "http explicit",
+			input:      "http://proxy.example:8080",
+			wantScheme: "http",
+			wantHost:   "proxy.example:8080",
+		},
+		{
+			name:       "scheme defaults to http",
+			input:      "proxy.example:8080",
+			wantScheme: "http",
+			wantHost:   "proxy.example:8080",
+		},
+		{
+			name:       "socks5h",
+			input:      "socks5h://proxy.example:1080",
+			wantScheme: "socks5h",
+			wantHost:   "proxy.example:1080",
+		},
+		{
+			name:    "unsupported scheme",
+			input:   "ftp://proxy.example:21",
+			wantErr: "unsupported proxy scheme",
+		},
+		{
+			name:    "missing host",
+			input:   "http://",
+			wantErr: "must include a host",
+		},
+		{
+			name:    "missing hostname",
+			input:   "http://:8080",
+			wantErr: "must include a host",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseProxyURL(tt.input)
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tt.wantErr)
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("error mismatch: got %q want substring %q", err.Error(), tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tt.wantNil {
+				if got != nil {
+					t.Fatalf("expected nil proxy URL, got %s", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatal("expected proxy URL, got nil")
+			}
+			if got.Scheme != tt.wantScheme {
+				t.Fatalf("scheme mismatch: got %q want %q", got.Scheme, tt.wantScheme)
+			}
+			if got.Host != tt.wantHost {
+				t.Fatalf("host mismatch: got %q want %q", got.Host, tt.wantHost)
+			}
+		})
+	}
+}
+
+func TestEffectiveProxyURLUsesExplicitProxy(t *testing.T) {
+	got, err := EffectiveProxyURL("socks5h://proxy.example:1080", "https://speed.cloudflare.com/")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected proxy URL, got nil")
+	}
+	if got.String() != "socks5h://proxy.example:1080" {
+		t.Fatalf("unexpected proxy URL: got %q", got.String())
+	}
+}
+
+func TestNewHTTPClientCanUseLocalhostProxy(t *testing.T) {
+	var requests int32
+	errCh := make(chan error, 1)
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		if got, want := r.URL.String(), "http://speed.cloudflare.test/probe"; got != want {
+			select {
+			case errCh <- fmt.Errorf("unexpected proxied URL: got %q want %q", got, want):
+			default:
+			}
+			http.Error(w, "unexpected URL", http.StatusBadGateway)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	t.Cleanup(proxy.Close)
+
+	_, port, err := net.SplitHostPort(proxy.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("split proxy address: %v", err)
+	}
+
+	httpClient, err := NewHTTPClient(false, false, "", false, "", "http://localhost:"+port)
+	if err != nil {
+		t.Fatalf("NewHTTPClient returned error: %v", err)
+	}
+
+	resp, err := httpClient.Get("http://speed.cloudflare.test/probe")
+	if err != nil {
+		t.Fatalf("proxy request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		select {
+		case err := <-errCh:
+			t.Fatal(err)
+		default:
+		}
+		t.Fatalf("unexpected response status: got %d want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if string(body) != "ok" {
+		t.Fatalf("unexpected response body: got %q want %q", string(body), "ok")
+	}
+	if got, want := atomic.LoadInt32(&requests), int32(1); got != want {
+		t.Fatalf("proxy request count mismatch: got %d want %d", got, want)
+	}
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	default:
 	}
 }

@@ -2,11 +2,13 @@ package app
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -28,11 +30,20 @@ const (
 	speedTestMeasure            = 8 * time.Second
 	speedTestHardTimeout        = 20 * time.Second
 	speedTestLiveWindow         = 1200 * time.Millisecond
+	speedTestLiveRollingMin     = 500 * time.Millisecond
 	speedTestLiveDenominatorMin = 500 * time.Millisecond
 	speedTestLiveBlendHorizon   = 2 * time.Second
 	speedTestLiveSmoothingAlpha = 0.35
+	uploadLiveWindow            = 4 * time.Second
+	uploadLiveRollingMin        = 2 * time.Second
+	uploadLiveDenominatorMin    = 2 * time.Second
+	uploadLiveBlendHorizon      = 5 * time.Second
+	uploadLiveSmoothingAlpha    = 0.08
 	speedTestRetryDelay         = 200 * time.Millisecond
+	uploadRequestBytes          = 32 * 1024 * 1024
 )
+
+var latencyProbeURL = "https://speed.cloudflare.com/cdn-cgi/trace"
 
 type TestMode uint8
 
@@ -80,21 +91,71 @@ type liveSpeedSample struct {
 
 type liveSpeedEstimator struct {
 	recorder *throughputRecorder
+	config   liveSpeedEstimatorConfig
 	samples  []liveSpeedSample
 	lastMbps float64
 	hasLast  bool
 }
 
+type liveSpeedEstimatorConfig struct {
+	window         time.Duration
+	rollingMin     time.Duration
+	denominatorMin time.Duration
+	blendHorizon   time.Duration
+	smoothingAlpha float64
+}
+
+var defaultLiveSpeedEstimatorConfig = liveSpeedEstimatorConfig{
+	window:         speedTestLiveWindow,
+	rollingMin:     speedTestLiveRollingMin,
+	denominatorMin: speedTestLiveDenominatorMin,
+	blendHorizon:   speedTestLiveBlendHorizon,
+	smoothingAlpha: speedTestLiveSmoothingAlpha,
+}
+
+var uploadLiveSpeedEstimatorConfig = liveSpeedEstimatorConfig{
+	window:         uploadLiveWindow,
+	rollingMin:     uploadLiveRollingMin,
+	denominatorMin: uploadLiveDenominatorMin,
+	blendHorizon:   uploadLiveBlendHorizon,
+	smoothingAlpha: uploadLiveSmoothingAlpha,
+}
+
 // Throughput tests manage cancellation explicitly, so they must not inherit the
 // generic client-wide deadline used by setup requests.
 func throughputClient(base *http.Client) *http.Client {
-	if base == nil || base.Timeout == 0 {
+	if base == nil {
 		return base
 	}
 
 	clone := *base
 	clone.Timeout = 0
+	clone.Transport = throughputRoundTripper(base.Transport)
 	return &clone
+}
+
+func throughputRoundTripper(rt http.RoundTripper) http.RoundTripper {
+	switch t := rt.(type) {
+	case *http.Transport:
+		return throughputTransport(t)
+	case *client.BrowserTransport:
+		clone := *t
+		clone.Transport = throughputTransport(t.Transport)
+		return &clone
+	default:
+		return rt
+	}
+}
+
+func throughputTransport(base *http.Transport) *http.Transport {
+	if base == nil {
+		return nil
+	}
+
+	clone := base.Clone()
+	clone.ForceAttemptHTTP2 = false
+	clone.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	return clone
 }
 
 func waitForRetry(ctx context.Context) bool {
@@ -212,8 +273,13 @@ func (r *throughputRecorder) activeDuration(now time.Time) time.Duration {
 }
 
 func newLiveSpeedEstimator(recorder *throughputRecorder) *liveSpeedEstimator {
+	return newLiveSpeedEstimatorWithConfig(recorder, defaultLiveSpeedEstimatorConfig)
+}
+
+func newLiveSpeedEstimatorWithConfig(recorder *throughputRecorder, config liveSpeedEstimatorConfig) *liveSpeedEstimator {
 	return &liveSpeedEstimator{
 		recorder: recorder,
+		config:   config,
 	}
 }
 
@@ -232,13 +298,13 @@ func (e *liveSpeedEstimator) current(now time.Time) float64 {
 		at:         now,
 		totalBytes: totalBytes,
 	})
-	for len(e.samples) > 1 && now.Sub(e.samples[0].at) > speedTestLiveWindow {
+	for len(e.samples) > 1 && now.Sub(e.samples[0].at) > e.config.window {
 		e.samples = e.samples[1:]
 	}
 
 	denominator := activeDuration
-	if denominator < speedTestLiveDenominatorMin {
-		denominator = speedTestLiveDenominatorMin
+	if denominator < e.config.denominatorMin {
+		denominator = e.config.denominatorMin
 	}
 	estimate := (float64(totalBytes) * 8) / (denominator.Seconds() * 1e6)
 
@@ -250,7 +316,7 @@ func (e *liveSpeedEstimator) current(now time.Time) float64 {
 	measuredBytes := e.recorder.measuredBytes.Load()
 	if measuredDuration > 0 && measuredBytes > 0 {
 		measuredMbps := (float64(measuredBytes) * 8) / (measuredDuration.Seconds() * 1e6)
-		confidence := measuredDuration.Seconds() / speedTestLiveBlendHorizon.Seconds()
+		confidence := measuredDuration.Seconds() / e.config.blendHorizon.Seconds()
 		if confidence > 1 {
 			confidence = 1
 		}
@@ -258,7 +324,7 @@ func (e *liveSpeedEstimator) current(now time.Time) float64 {
 	}
 
 	if e.hasLast {
-		estimate = (speedTestLiveSmoothingAlpha * estimate) + ((1 - speedTestLiveSmoothingAlpha) * e.lastMbps)
+		estimate = (e.config.smoothingAlpha * estimate) + ((1 - e.config.smoothingAlpha) * e.lastMbps)
 	}
 	e.lastMbps = estimate
 	e.hasLast = true
@@ -276,7 +342,7 @@ func (e *liveSpeedEstimator) rollingMbps(now time.Time, totalBytes int64) (float
 
 	oldest := e.samples[0]
 	window := now.Sub(oldest.at)
-	if window <= 0 {
+	if window < e.config.rollingMin {
 		return 0, false
 	}
 
@@ -361,9 +427,6 @@ func RunSpeedTest(client *http.Client, opts RunOptions) (*data.TestResult, error
 }
 
 func measureLatency(c *http.Client, latencyAttempts int) (*data.LatencyResult, error) {
-	attempts := latencyAttempts
-	var latencies []float64
-
 	var transport *http.Transport
 	if t, ok := c.Transport.(*http.Transport); ok {
 		transport = t
@@ -373,12 +436,48 @@ func measureLatency(c *http.Client, latencyAttempts int) (*data.LatencyResult, e
 		return nil, fmt.Errorf("invalid transport type, expected *http.Transport")
 	}
 
+	usesProxy, err := transportUsesProxy(transport, latencyProbeURL)
+	if err != nil {
+		return nil, fmt.Errorf("proxy resolution failed: %w", err)
+	}
+	if usesProxy {
+		return measureHTTPLatency(c, transport, latencyAttempts)
+	}
+
+	return measureDialLatency(transport, latencyAttempts)
+}
+
+func transportUsesProxy(transport *http.Transport, targetURL string) (bool, error) {
+	if transport == nil || transport.Proxy == nil {
+		return false, nil
+	}
+
+	req, err := http.NewRequest(http.MethodGet, targetURL, nil)
+	if err != nil {
+		return false, err
+	}
+
+	proxyURL, err := transport.Proxy(req)
+	if err != nil {
+		return false, err
+	}
+	return proxyURL != nil, nil
+}
+
+func measureDialLatency(transport *http.Transport, attempts int) (*data.LatencyResult, error) {
+	var latencies []float64
+	dialContext := transport.DialContext
+	if dialContext == nil {
+		dialer := &net.Dialer{}
+		dialContext = dialer.DialContext
+	}
+
 	for i := 0; i < attempts; i++ {
 		// Increased timeout significantly to 15s.
 		// This handles slow DNS resolution and multiple IP failovers in the custom dialer.
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		start := time.Now()
-		conn, err := transport.DialContext(ctx, "tcp", "speed.cloudflare.com:443")
+		conn, err := dialContext(ctx, "tcp", "speed.cloudflare.com:443")
 		if err != nil {
 			cancel()
 			return nil, fmt.Errorf("failed to dial server: %w", err)
@@ -394,6 +493,56 @@ func measureLatency(c *http.Client, latencyAttempts int) (*data.LatencyResult, e
 		}
 	}
 
+	return summarizeLatencies(latencies), nil
+}
+
+func measureHTTPLatency(c *http.Client, transport *http.Transport, attempts int) (*data.LatencyResult, error) {
+	var latencies []float64
+
+	for i := 0; i < attempts; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, latencyProbeURL, nil)
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+		req.Close = true
+
+		transport.CloseIdleConnections()
+		start := time.Now()
+		resp, err := c.Do(req)
+		if err != nil {
+			cancel()
+			return nil, fmt.Errorf("failed to probe server through proxy: %w", err)
+		}
+		latency := time.Since(start).Seconds() * 1000
+
+		_, readErr := io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
+		closeErr := resp.Body.Close()
+		cancel()
+		transport.CloseIdleConnections()
+
+		if readErr != nil {
+			return nil, fmt.Errorf("reading latency probe response: %w", readErr)
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("closing latency probe response: %w", closeErr)
+		}
+		if resp.StatusCode >= http.StatusBadRequest {
+			return nil, fmt.Errorf("latency probe returned status %d", resp.StatusCode)
+		}
+
+		latencies = append(latencies, latency)
+
+		if i < attempts-1 {
+			time.Sleep(time.Duration(rand.Intn(50)) * time.Millisecond)
+		}
+	}
+
+	return summarizeLatencies(latencies), nil
+}
+
+func summarizeLatencies(latencies []float64) *data.LatencyResult {
 	sum := 0.0
 	min := math.MaxFloat64
 	max := 0.0
@@ -419,7 +568,7 @@ func measureLatency(c *http.Client, latencyAttempts int) (*data.LatencyResult, e
 		Jitter: jitter,
 		Min:    min,
 		Max:    max,
-	}, nil
+	}
 }
 
 func runTest(name string, worker func(context.Context, *throughputRecorder, *http.Client, bool), client *http.Client, multiple bool, workers int, jsonOutput bool, continuous bool) data.Speed {
@@ -431,7 +580,7 @@ func runTest(name string, worker func(context.Context, *throughputRecorder, *htt
 		measureWindow = 0
 	}
 	recorder := newThroughputRecorder(start, speedTestWarmup, measureWindow)
-	liveEstimator := newLiveSpeedEstimator(recorder)
+	liveEstimator := newLiveSpeedEstimatorWithConfig(recorder, liveSpeedConfigForTest(name))
 
 	parentCtx := context.Background()
 	var stopSignals context.CancelFunc
@@ -518,6 +667,13 @@ func runTest(name string, worker func(context.Context, *throughputRecorder, *htt
 	}
 }
 
+func liveSpeedConfigForTest(name string) liveSpeedEstimatorConfig {
+	if name == "Upload:" {
+		return uploadLiveSpeedEstimatorConfig
+	}
+	return defaultLiveSpeedEstimatorConfig
+}
+
 func downloadWorker(ctx context.Context, recorder *throughputRecorder, client *http.Client, continuous bool) {
 	buf := make([]byte, 256*1024)
 	for ctx.Err() == nil {
@@ -568,8 +724,8 @@ func downloadWorker(ctx context.Context, recorder *throughputRecorder, client *h
 
 func uploadWorker(ctx context.Context, recorder *throughputRecorder, client *http.Client, continuous bool) {
 	for ctx.Err() == nil {
-		req, _ := http.NewRequest("POST", "https://speed.cloudflare.com/__up", newUploadStream(ctx, recorder))
-		req = req.WithContext(ctx)
+		req, _ := http.NewRequestWithContext(ctx, "POST", "https://speed.cloudflare.com/__up", newUploadStream(ctx, recorder, uploadRequestBytes))
+		req.ContentLength = uploadRequestBytes
 		req.Header.Set("Content-Type", "application/octet-stream")
 
 		resp, err := client.Do(req)
@@ -603,29 +759,37 @@ func uploadWorker(ctx context.Context, recorder *throughputRecorder, client *htt
 }
 
 type uploadStream struct {
-	ctx      context.Context
-	recorder *throughputRecorder
-	payload  []byte
-	offset   int
+	ctx       context.Context
+	recorder  *throughputRecorder
+	payload   []byte
+	offset    int
+	remaining int64
 }
 
-func newUploadStream(ctx context.Context, recorder *throughputRecorder) io.Reader {
+func newUploadStream(ctx context.Context, recorder *throughputRecorder, size int64) io.Reader {
 	payload := make([]byte, 1<<20)
 	rand.Read(payload)
 
 	return &uploadStream{
-		ctx:      ctx,
-		recorder: recorder,
-		payload:  payload,
+		ctx:       ctx,
+		recorder:  recorder,
+		payload:   payload,
+		remaining: size,
 	}
 }
 
 func (s *uploadStream) Read(p []byte) (int, error) {
 	if err := s.ctx.Err(); err != nil {
+		return 0, err
+	}
+	if s.remaining <= 0 {
 		return 0, io.EOF
 	}
 	if len(p) == 0 {
 		return 0, nil
+	}
+	if int64(len(p)) > s.remaining {
+		p = p[:int(s.remaining)]
 	}
 
 	written := 0
@@ -639,5 +803,6 @@ func (s *uploadStream) Read(p []byte) (int, error) {
 	}
 
 	s.recorder.Add(written)
+	s.remaining -= int64(written)
 	return written, nil
 }

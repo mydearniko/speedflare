@@ -3,8 +3,11 @@ package app
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -113,9 +116,37 @@ func TestLiveSpeedEstimatorUsesRollingWindow(t *testing.T) {
 	}
 }
 
+func TestUploadLiveSpeedEstimatorDampensShortBursts(t *testing.T) {
+	now := time.Now()
+	recorder := &throughputRecorder{
+		start:       now.Add(-2500 * time.Millisecond),
+		warmup:      0,
+		measure:     speedTestMeasure,
+		firstByteCh: make(chan struct{}),
+	}
+	recorder.firstByteNs.Store(0)
+
+	estimator := newLiveSpeedEstimatorWithConfig(recorder, uploadLiveSpeedEstimatorConfig)
+
+	recorder.totalBytes.Store(100_000_000)
+	recorder.measuredBytes.Store(100_000_000)
+	first := estimator.current(now)
+
+	recorder.totalBytes.Store(180_000_000)
+	recorder.measuredBytes.Store(180_000_000)
+	second := estimator.current(now.Add(100 * time.Millisecond))
+
+	if first <= 0 {
+		t.Fatalf("expected positive first estimate, got %.2f", first)
+	}
+	if second > first*1.25 {
+		t.Fatalf("expected upload live estimate to dampen a short burst, got first %.2f second %.2f", first, second)
+	}
+}
+
 func TestUploadStreamCountsBytesRead(t *testing.T) {
 	recorder := newThroughputRecorder(time.Now(), 0, time.Second)
-	stream := newUploadStream(context.Background(), recorder)
+	stream := newUploadStream(context.Background(), recorder, 32*1024)
 	buf := make([]byte, 32*1024)
 
 	n, err := stream.Read(buf)
@@ -134,8 +165,38 @@ func TestUploadStreamCountsBytesRead(t *testing.T) {
 	}
 }
 
+func TestUploadStreamStopsAtConfiguredSize(t *testing.T) {
+	recorder := newThroughputRecorder(time.Now(), 0, time.Second)
+	stream := newUploadStream(context.Background(), recorder, 40*1024)
+	buf := make([]byte, 32*1024)
+
+	n, err := stream.Read(buf)
+	if err != nil {
+		t.Fatalf("unexpected first read error: %v", err)
+	}
+	if n != 32*1024 {
+		t.Fatalf("first read length mismatch: got %d want %d", n, 32*1024)
+	}
+
+	n, err = stream.Read(buf)
+	if err != nil {
+		t.Fatalf("unexpected second read error: %v", err)
+	}
+	if n != 8*1024 {
+		t.Fatalf("second read length mismatch: got %d want %d", n, 8*1024)
+	}
+
+	n, err = stream.Read(buf)
+	if err != io.EOF {
+		t.Fatalf("expected EOF after configured size, got n=%d err=%v", n, err)
+	}
+	if got, want := recorder.totalBytes.Load(), int64(40*1024); got != want {
+		t.Fatalf("total bytes mismatch: got %d want %d", got, want)
+	}
+}
+
 func TestThroughputClientDisablesClientTimeout(t *testing.T) {
-	transport := &http.Transport{}
+	transport := &http.Transport{ForceAttemptHTTP2: true}
 	base := &http.Client{
 		Transport: transport,
 		Timeout:   30 * time.Second,
@@ -148,8 +209,18 @@ func TestThroughputClientDisablesClientTimeout(t *testing.T) {
 	if got.Timeout != 0 {
 		t.Fatalf("expected throughput client timeout to be disabled, got %v", got.Timeout)
 	}
-	if got.Transport != transport {
-		t.Fatalf("expected throughput client to reuse transport")
+	gotTransport, ok := got.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("expected throughput transport to be *http.Transport, got %T", got.Transport)
+	}
+	if gotTransport == transport {
+		t.Fatal("expected throughput transport to be cloned")
+	}
+	if gotTransport.ForceAttemptHTTP2 {
+		t.Fatal("expected throughput transport to disable HTTP/2")
+	}
+	if gotTransport.TLSNextProto == nil {
+		t.Fatal("expected throughput transport to disable automatic HTTP/2 with an empty TLSNextProto map")
 	}
 	if base.Timeout != 30*time.Second {
 		t.Fatalf("expected base client timeout to remain unchanged, got %v", base.Timeout)
@@ -179,6 +250,62 @@ func TestRunTestPassesTimeoutlessClientToWorker(t *testing.T) {
 
 	if base.Timeout != 30*time.Second {
 		t.Fatalf("expected base client timeout to remain unchanged, got %v", base.Timeout)
+	}
+}
+
+func TestMeasureLatencyUsesHTTPProbeWhenProxyConfigured(t *testing.T) {
+	var requests int32
+	errCh := make(chan error, 1)
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		if got, want := r.URL.String(), "http://speed.cloudflare.test/cdn-cgi/trace"; got != want {
+			select {
+			case errCh <- fmt.Errorf("unexpected proxied request URL: got %q want %q", got, want):
+			default:
+			}
+			http.Error(w, "unexpected URL", http.StatusBadGateway)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	t.Cleanup(proxy.Close)
+
+	originalProbeURL := latencyProbeURL
+	latencyProbeURL = "http://speed.cloudflare.test/cdn-cgi/trace"
+	t.Cleanup(func() {
+		latencyProbeURL = originalProbeURL
+	})
+
+	proxyURL, err := url.Parse(proxy.URL)
+	if err != nil {
+		t.Fatalf("parse proxy URL: %v", err)
+	}
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+		},
+	}
+
+	result, err := measureLatency(httpClient, 2)
+	if err != nil {
+		select {
+		case handlerErr := <-errCh:
+			t.Fatal(handlerErr)
+		default:
+		}
+		t.Fatalf("measureLatency returned error: %v", err)
+	}
+	if result.Avg <= 0 {
+		t.Fatalf("expected positive average latency, got %.2f", result.Avg)
+	}
+	if got, want := atomic.LoadInt32(&requests), int32(2); got != want {
+		t.Fatalf("proxy request count mismatch: got %d want %d", got, want)
+	}
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	default:
 	}
 }
 
@@ -225,6 +352,9 @@ func TestUploadWorkerRestartsRequestsUntilContextCanceled(t *testing.T) {
 	client := &http.Client{
 		Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 			call := atomic.AddInt32(&calls, 1)
+			if req.ContentLength != uploadRequestBytes {
+				t.Fatalf("content length mismatch: got %d want %d", req.ContentLength, uploadRequestBytes)
+			}
 
 			buf := make([]byte, chunkSize)
 			if _, err := io.ReadFull(req.Body, buf); err != nil {
