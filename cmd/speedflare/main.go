@@ -29,14 +29,15 @@ var (
 	uploadOnly       = pflag.BoolP("upload-only", "U", false, "Run only the upload test.")
 	downloadOnly     = pflag.BoolP("download-only", "D", false, "Run only the download test.")
 	latencyOnly      = pflag.BoolP("latency-only", "L", false, "Run only the latency test.")
+	bidirectional    = pflag.BoolP("bidirectional", "B", false, "Run upload and download tests at the same time.")
 	continuous       = pflag.BoolP("continuous", "C", false, "Run upload-only or download-only continuously until interrupted.")
 	workers          = pflag.IntP("workers", "w", 6, "Number of workers for multithreaded speedtests.")
 	insecure         = pflag.Bool("insecure", false, "Skip TLS certificate verification (UNSAFE).")
 	hideIP           = pflag.Bool("hide-ip", false, "Hide the IP address in output.")
-	probe198Only     = pflag.Bool("198", false, "Use only 198.41.192.0/21 and 198.41.200.0/21 for datacenter probing.")
+	probe198Only     = pflag.Bool("198", false, "Use only 198.41.192.0/21 and 198.41.200.0/21 for IPv4 datacenter probing.")
 )
 
-func resolveTestMode(upload, download, latency bool) (app.TestMode, error) {
+func resolveTestMode(upload, download, latency, bidirectional bool) (app.TestMode, error) {
 	selected := 0
 	if upload {
 		selected++
@@ -47,8 +48,11 @@ func resolveTestMode(upload, download, latency bool) (app.TestMode, error) {
 	if latency {
 		selected++
 	}
+	if bidirectional {
+		selected++
+	}
 	if selected > 1 {
-		return app.TestModeDefault, fmt.Errorf("--upload-only (-U), --download-only (-D), and --latency-only (-L) are mutually exclusive")
+		return app.TestModeDefault, fmt.Errorf("--upload-only (-U), --download-only (-D), --latency-only (-L), and --bidirectional (-B) are mutually exclusive")
 	}
 
 	switch {
@@ -58,6 +62,8 @@ func resolveTestMode(upload, download, latency bool) (app.TestMode, error) {
 		return app.TestModeDownloadOnly, nil
 	case latency:
 		return app.TestModeLatencyOnly, nil
+	case bidirectional:
+		return app.TestModeBidirectional, nil
 	default:
 		return app.TestModeDefault, nil
 	}
@@ -71,6 +77,18 @@ func validateContinuousFlag(mode app.TestMode, enabled bool) error {
 		return fmt.Errorf("--continuous (-C) requires --upload-only (-U) or --download-only (-D)")
 	}
 	return nil
+}
+
+func useIPv6ForProbing(traceIP string, ipv4Only, ipv6Only bool) bool {
+	if ipv6Only {
+		return true
+	}
+	if ipv4Only {
+		return false
+	}
+
+	ip := net.ParseIP(traceIP)
+	return ip != nil && ip.To4() == nil
 }
 
 func main() {
@@ -98,7 +116,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	mode, err := resolveTestMode(*uploadOnly, *downloadOnly, *latencyOnly)
+	mode, err := resolveTestMode(*uploadOnly, *downloadOnly, *latencyOnly, *bidirectional)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v.\n", err)
 		os.Exit(2)
@@ -130,12 +148,6 @@ func main() {
 		os.Exit(2)
 	}
 	proxyActive := effectiveProxyURL != nil
-	if proxyActive && *originIP != "" {
-		fmt.Fprintln(os.Stderr, "Error: --origin-ip cannot be used when a proxy is configured.")
-		fmt.Fprintln(os.Stderr, "Hint: Omit --proxy, unset proxy environment variables, or set NO_PROXY for speed.cloudflare.com.")
-		os.Exit(2)
-	}
-
 	effectiveInterfaceName := *interfaceName
 
 	if *singleConnection {
@@ -167,7 +179,7 @@ func main() {
 	}
 	if proxyActive && !*jsonOutput && !*list {
 		yellow := color.New(color.FgYellow).FprintfFunc()
-		yellow(os.Stderr, "Warning: Proxy configured; direct datacenter probing will be skipped.\n")
+		yellow(os.Stderr, "Warning: Proxy configured; colo detection and speed tests will use the proxy egress.\n")
 	}
 
 	// Initial Client Creation (for trace and location fetching)
@@ -200,33 +212,37 @@ func main() {
 	// 2. Probe for Fragmentation
 	suppressIntro := false
 
-	if !*ipv6 && selectedOriginIP == "" && !proxyActive {
+	if selectedOriginIP == "" {
+		probeIPv6 := useIPv6ForProbing(trace["ip"], *ipv4, *ipv6)
 		// Resolve User Location (only needed for probing)
-		userLat, userLon, geoErr := location.GetUserCoordinates(effectiveInterfaceName)
+		userLat, userLon, geoErr := location.GetUserCoordinates(effectiveInterfaceName, trace["ip"], *ipv4, *ipv6, *proxyAddress)
 		if geoErr != nil && !*jsonOutput {
 			yellow := color.New(color.FgYellow).FprintfFunc()
 			yellow(os.Stderr, "Warning: GeoIP lookup failed (%v). Falling back to Cloudflare country estimate.\n", geoErr)
 		}
 
 		// Pass Coordinates + Trace Colo + Trace Country + Locations Lib
-		servers, err := location.ProbeColos(userLat, userLon, trace["colo"], trace["loc"], locs, effectiveInterfaceName)
-		if err == nil && len(servers) > 1 {
-			// Ask user to choose
-			if !*jsonOutput {
+		servers, err := location.ProbeColos(userLat, userLon, trace["colo"], trace["loc"], locs, location.ProbeOptions{
+			InterfaceOrIP: effectiveInterfaceName,
+			IPv6:          probeIPv6,
+			ProxyURL:      effectiveProxyURL,
+		})
+		if err == nil && len(servers) > 0 {
+			selectedIndex := 0
+			interactiveSelection := len(servers) > 1 && !*jsonOutput
+			if interactiveSelection {
 				output.PrintClientInfo(trace, *jsonOutput, *hideIP)
-
-				idx := output.SelectServer(servers)
-				selected := servers[idx]
-				selectedOriginIP = selected.IP
-
-				// Re-create client with forced IP
-				httpClient, err = client.NewHTTPClient(*ipv4, *ipv6, effectiveInterfaceName, *insecure, selectedOriginIP, *proxyAddress)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error creating client for selected colo: %v\n", err)
-					os.Exit(1)
-				}
-
+				selectedIndex = output.SelectServer(servers)
 				suppressIntro = true
+			}
+
+			selectedOriginIP = servers[selectedIndex].IP
+			httpClient, err = client.NewHTTPClient(*ipv4, *ipv6, effectiveInterfaceName, *insecure, selectedOriginIP, *proxyAddress)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error creating client for selected colo: %v\n", err)
+				os.Exit(1)
+			}
+			if interactiveSelection {
 				fmt.Println()
 			}
 		}

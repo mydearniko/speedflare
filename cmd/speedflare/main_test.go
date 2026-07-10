@@ -12,6 +12,7 @@ func TestResolveTestMode(t *testing.T) {
 		upload    bool
 		download  bool
 		latency   bool
+		bidir     bool
 		wantMode  app.TestMode
 		wantError bool
 	}{
@@ -33,6 +34,11 @@ func TestResolveTestMode(t *testing.T) {
 			name:     "latency only",
 			latency:  true,
 			wantMode: app.TestModeLatencyOnly,
+		},
+		{
+			name:     "bidirectional",
+			bidir:    true,
+			wantMode: app.TestModeBidirectional,
 		},
 		{
 			name:      "upload and download conflict",
@@ -59,11 +65,17 @@ func TestResolveTestMode(t *testing.T) {
 			latency:   true,
 			wantError: true,
 		},
+		{
+			name:      "bidirectional and upload conflict",
+			upload:    true,
+			bidir:     true,
+			wantError: true,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := resolveTestMode(tt.upload, tt.download, tt.latency)
+			got, err := resolveTestMode(tt.upload, tt.download, tt.latency, tt.bidir)
 			if tt.wantError {
 				if err == nil {
 					t.Fatal("expected an error, got nil")
@@ -114,6 +126,12 @@ func TestValidateContinuousFlag(t *testing.T) {
 			enabled:   true,
 			wantError: true,
 		},
+		{
+			name:      "bidirectional mode rejected",
+			mode:      app.TestModeBidirectional,
+			enabled:   true,
+			wantError: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -124,6 +142,30 @@ func TestValidateContinuousFlag(t *testing.T) {
 			}
 			if !tt.wantError && err != nil {
 				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestUseIPv6ForProbing(t *testing.T) {
+	tests := []struct {
+		name     string
+		traceIP  string
+		ipv4Only bool
+		ipv6Only bool
+		wantIPv6 bool
+	}{
+		{name: "forced IPv4", traceIP: "2001:db8::10", ipv4Only: true},
+		{name: "forced IPv6", traceIP: "192.0.2.10", ipv6Only: true, wantIPv6: true},
+		{name: "automatic IPv4", traceIP: "192.0.2.10"},
+		{name: "automatic IPv6", traceIP: "2001:db8::10", wantIPv6: true},
+		{name: "invalid trace defaults to IPv4", traceIP: "not-an-ip"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := useIPv6ForProbing(tt.traceIP, tt.ipv4Only, tt.ipv6Only); got != tt.wantIPv6 {
+				t.Fatalf("probe family mismatch: got IPv6=%v want %v", got, tt.wantIPv6)
 			}
 		})
 	}

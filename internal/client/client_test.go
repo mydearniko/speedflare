@@ -305,3 +305,162 @@ func TestNewHTTPClientCanUseLocalhostProxy(t *testing.T) {
 	default:
 	}
 }
+
+func TestRewriteRequestForOriginPreservesSpeedflareIdentity(t *testing.T) {
+	req, err := http.NewRequest(http.MethodGet, "https://speed.cloudflare.com/cdn-cgi/trace", nil)
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+
+	if err := rewriteRequestForOrigin(req, "2001:db8::20"); err != nil {
+		t.Fatalf("rewriteRequestForOrigin returned error: %v", err)
+	}
+	if got, want := req.URL.Host, "[2001:db8::20]:443"; got != want {
+		t.Fatalf("target authority mismatch: got %q want %q", got, want)
+	}
+	if got, want := req.Host, "speed.cloudflare.com"; got != want {
+		t.Fatalf("HTTP host mismatch: got %q want %q", got, want)
+	}
+}
+
+func TestRewriteRequestForOriginLeavesOtherHostsUnchanged(t *testing.T) {
+	req, err := http.NewRequest(http.MethodGet, "https://example.com/probe", nil)
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+
+	if err := rewriteRequestForOrigin(req, "192.0.2.20"); err != nil {
+		t.Fatalf("rewriteRequestForOrigin returned error: %v", err)
+	}
+	if got, want := req.URL.Host, "example.com"; got != want {
+		t.Fatalf("unexpected target rewrite: got %q want %q", got, want)
+	}
+}
+
+func TestNewHTTPClientRoutesIPv6OriginThroughIPv4Proxy(t *testing.T) {
+	httpClient, err := NewHTTPClient(false, true, "", true, "2001:db8::20", "http://127.0.0.1:8080")
+	if err != nil {
+		t.Fatalf("NewHTTPClient returned error: %v", err)
+	}
+
+	browserTransport, ok := httpClient.Transport.(*BrowserTransport)
+	if !ok {
+		t.Fatalf("unexpected transport type: %T", httpClient.Transport)
+	}
+	if !browserTransport.RewriteOrigin {
+		t.Fatal("expected proxied origin requests to be rewritten")
+	}
+	if got, want := browserTransport.Transport.TLSClientConfig.ServerName, "speed.cloudflare.com"; got != want {
+		t.Fatalf("TLS server name mismatch: got %q want %q", got, want)
+	}
+
+	req, err := http.NewRequest(http.MethodGet, "https://speed.cloudflare.com/cdn-cgi/trace", nil)
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	if err := rewriteRequestForOrigin(req, browserTransport.OriginIP); err != nil {
+		t.Fatalf("rewrite request: %v", err)
+	}
+	proxyURL, err := browserTransport.Transport.Proxy(req)
+	if err != nil {
+		t.Fatalf("resolve proxy: %v", err)
+	}
+	if got, want := proxyURL.String(), "http://127.0.0.1:8080"; got != want {
+		t.Fatalf("proxy mismatch: got %q want %q", got, want)
+	}
+}
+
+func TestNewHTTPClientConfiguresSeparateHTTPSProxyTLS(t *testing.T) {
+	httpClient, err := NewHTTPClient(false, true, "", true, "2001:db8::20", "https://proxy.example:8443")
+	if err != nil {
+		t.Fatalf("NewHTTPClient returned error: %v", err)
+	}
+	browserTransport, ok := httpClient.Transport.(*BrowserTransport)
+	if !ok {
+		t.Fatalf("unexpected transport type: %T", httpClient.Transport)
+	}
+	if browserTransport.Transport.DialTLSContext == nil {
+		t.Fatal("expected a separate TLS dialer for the HTTPS proxy hop")
+	}
+	if got, want := browserTransport.Transport.TLSClientConfig.ServerName, "speed.cloudflare.com"; got != want {
+		t.Fatalf("origin TLS server name mismatch: got %q want %q", got, want)
+	}
+}
+
+func TestNewHTTPClientConnectsToIPv6OriginThroughIPv4Proxy(t *testing.T) {
+	requestErr := make(chan error, 2)
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.Host, "speed.cloudflare.com"; got != want {
+			requestErr <- fmt.Errorf("HTTP host mismatch: got %q want %q", got, want)
+		}
+		if r.TLS == nil || r.TLS.ServerName != "speed.cloudflare.com" {
+			requestErr <- fmt.Errorf("TLS server name mismatch: got %#v", r.TLS)
+		}
+		fmt.Fprintln(w, "colo=FRA")
+	}))
+	t.Cleanup(origin.Close)
+
+	connectTarget := make(chan string, 1)
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			http.Error(w, "CONNECT required", http.StatusMethodNotAllowed)
+			return
+		}
+		connectTarget <- r.Host
+
+		upstream, err := net.Dial("tcp", origin.Listener.Addr().String())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			upstream.Close()
+			http.Error(w, "hijacking unsupported", http.StatusInternalServerError)
+			return
+		}
+		downstream, buffered, err := hijacker.Hijack()
+		if err != nil {
+			upstream.Close()
+			return
+		}
+		_, _ = buffered.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
+		_ = buffered.Flush()
+
+		go func() {
+			_, _ = io.Copy(upstream, downstream)
+			_ = upstream.Close()
+		}()
+		_, _ = io.Copy(downstream, upstream)
+		_ = downstream.Close()
+	}))
+	t.Cleanup(proxy.Close)
+
+	httpClient, err := NewHTTPClient(false, true, "", true, "2001:db8::20", proxy.URL)
+	if err != nil {
+		t.Fatalf("NewHTTPClient returned error: %v", err)
+	}
+	resp, err := httpClient.Get("https://speed.cloudflare.com/cdn-cgi/trace")
+	if err != nil {
+		t.Fatalf("proxied origin request failed: %v", err)
+	}
+	_, readErr := io.Copy(io.Discard, resp.Body)
+	closeErr := resp.Body.Close()
+	if readErr != nil || closeErr != nil {
+		t.Fatalf("closing response: read=%v close=%v", readErr, closeErr)
+	}
+
+	select {
+	case got := <-connectTarget:
+		if want := "[2001:db8::20]:443"; got != want {
+			t.Fatalf("CONNECT target mismatch: got %q want %q", got, want)
+		}
+	default:
+		t.Fatal("proxy did not receive CONNECT request")
+	}
+	select {
+	case err := <-requestErr:
+		t.Fatal(err)
+	default:
+	}
+}

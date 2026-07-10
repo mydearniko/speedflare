@@ -11,6 +11,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -39,6 +40,8 @@ var probe198Ranges = []string{
 const (
 	defaultProbeCountPerRange = 255
 	probe198CountPerRange     = 765
+	probeWorkerLimit          = 256
+	proxyProbeWorkerLimit     = 128
 	earthRadiusKm             = 6371.0
 )
 
@@ -119,15 +122,40 @@ type serverCandidate struct {
 // userLat/userLon: Explicit coordinates from GeoIP.
 // userColo: The current Cloudflare PoP, used only as a last-resort sorting hint.
 // userCountryCode: Country code from Cloudflare trace.
-func ProbeColos(userLat, userLon float64, userColo string, userCountryCode string, allLocs []data.Location, interfaceName string) ([]data.Server, error) {
+type ProbeOptions struct {
+	InterfaceOrIP string
+	IPv6          bool
+	ProxyURL      *url.URL
+}
+
+func ProbeColos(userLat, userLon float64, userColo string, userCountryCode string, allLocs []data.Location, opts ProbeOptions) ([]data.Server, error) {
 	var ips []string
-	for _, cidr := range probeRanges {
-		generated, err := generateRandomIPs(cidr, probeCountPerRange)
-		if err == nil {
-			ips = append(ips, generated...)
+	if opts.IPv6 {
+		var err error
+		ips, err = ipv6ProbeTargets()
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		for _, cidr := range probeRanges {
+			generated, err := generateRandomIPs(cidr, probeCountPerRange)
+			if err == nil {
+				ips = append(ips, generated...)
+			}
 		}
 	}
 
+	concurrency := probeWorkerLimit
+	if opts.ProxyURL != nil {
+		concurrency = proxyProbeWorkerLimit
+	}
+	uniqueColos := probeColoTargets(ips, opts, concurrency, probeSingleIP)
+	return buildServerChoices(uniqueColos, userLat, userLon, userColo, userCountryCode, allLocs), nil
+}
+
+type coloProbeFunc func(string, ProbeOptions) (string, error)
+
+func probeColoTargets(ips []string, opts ProbeOptions, concurrency int, probe coloProbeFunc) map[string]string {
 	type probeResult struct {
 		Colo string
 		IP   string
@@ -135,8 +163,10 @@ func ProbeColos(userLat, userLon float64, userColo string, userCountryCode strin
 	results := make(chan probeResult, len(ips))
 	var wg sync.WaitGroup
 
-	// Use high concurrency for speed
-	workerLimit := make(chan struct{}, 256)
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	workerLimit := make(chan struct{}, concurrency)
 
 	for _, ip := range ips {
 		wg.Add(1)
@@ -145,7 +175,7 @@ func ProbeColos(userLat, userLon float64, userColo string, userCountryCode strin
 			workerLimit <- struct{}{}
 			defer func() { <-workerLimit }()
 
-			colo, err := probeSingleIP(targetIP, interfaceName)
+			colo, err := probe(targetIP, opts)
 			if err == nil && colo != "" {
 				results <- probeResult{Colo: colo, IP: targetIP}
 			}
@@ -162,7 +192,7 @@ func ProbeColos(userLat, userLon float64, userColo string, userCountryCode strin
 		}
 	}
 
-	return buildServerChoices(uniqueColos, userLat, userLon, userColo, userCountryCode, allLocs), nil
+	return uniqueColos
 }
 
 func buildServerChoices(uniqueColos map[string]string, userLat, userLon float64, userColo string, userCountryCode string, allLocs []data.Location) []data.Server {
@@ -249,25 +279,27 @@ func resolveDisplayReference(userLat, userLon float64, userCountryCode string, a
 	return latSum / float64(count), lonSum / float64(count), true
 }
 
-func probeSingleIP(ip string, interfaceName string) (string, error) {
-	// Increased timeouts slightly to avoid skipping good servers on jittery lines
-	dialer := &net.Dialer{
-		Timeout: 1500 * time.Millisecond,
+func probeSingleIP(ip string, opts ProbeOptions) (string, error) {
+	targetIP := net.ParseIP(ip)
+	if targetIP == nil {
+		return "", fmt.Errorf("invalid probe IP %q", ip)
 	}
 
-	if interfaceName != "" {
-		dialer.Control = func(network, address string, c syscall.RawConn) error {
-			return client.BindSocketToDevice(network, address, interfaceName, c)
-		}
+	dialer, err := newProbeDialer(targetIP, opts.InterfaceOrIP, opts.ProxyURL == nil)
+	if err != nil {
+		return "", err
 	}
 
 	dialNetwork := "tcp4"
-	if parsedIP := net.ParseIP(ip); parsedIP != nil && parsedIP.To4() == nil {
+	if targetIP.To4() == nil {
 		dialNetwork = "tcp6"
 	}
 
 	tr := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if opts.ProxyURL != nil {
+				return dialer.DialContext(ctx, network, addr)
+			}
 			return dialer.DialContext(ctx, dialNetwork, net.JoinHostPort(ip, "443"))
 		},
 		TLSHandshakeTimeout: 1500 * time.Millisecond,
@@ -278,17 +310,56 @@ func probeSingleIP(ip string, interfaceName string) (string, error) {
 		},
 		ForceAttemptHTTP2: true,
 	}
+	if opts.ProxyURL != nil {
+		tr.Proxy = http.ProxyURL(opts.ProxyURL)
+		if strings.EqualFold(opts.ProxyURL.Scheme, "https") {
+			baseDialContext := tr.DialContext
+			tr.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				conn, err := baseDialContext(ctx, network, addr)
+				if err != nil {
+					return nil, err
+				}
+				host, _, err := net.SplitHostPort(addr)
+				if err != nil {
+					conn.Close()
+					return nil, err
+				}
+				proxyTLSConfig := tr.TLSClientConfig.Clone()
+				proxyTLSConfig.ServerName = host
+				tlsConn := tls.Client(conn, proxyTLSConfig)
+				if err := tlsConn.HandshakeContext(ctx); err != nil {
+					conn.Close()
+					return nil, err
+				}
+				return tlsConn, nil
+			}
+		}
+	}
 
-	client := &http.Client{
+	httpClient := &http.Client{
 		Transport: tr,
 		Timeout:   2500 * time.Millisecond,
 	}
 
-	resp, err := client.Get("https://speed.cloudflare.com/cdn-cgi/trace")
+	probeURL := (&url.URL{
+		Scheme: "https",
+		Host:   net.JoinHostPort(ip, "443"),
+		Path:   "/cdn-cgi/trace",
+	}).String()
+	req, err := http.NewRequest(http.MethodGet, probeURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Host = "speed.cloudflare.com"
+
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("probe returned status %d", resp.StatusCode)
+	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024))
 	if err != nil {
@@ -303,6 +374,24 @@ func probeSingleIP(ip string, interfaceName string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("no colo found")
+}
+
+func newProbeDialer(targetIP net.IP, interfaceOrIP string, enforceTargetFamily bool) (*net.Dialer, error) {
+	// Increased timeout slightly to avoid skipping good servers on jittery lines.
+	dialer := &net.Dialer{Timeout: 1500 * time.Millisecond}
+
+	if sourceIP := net.ParseIP(interfaceOrIP); sourceIP != nil {
+		if enforceTargetFamily && (sourceIP.To4() == nil) != (targetIP.To4() == nil) {
+			return nil, fmt.Errorf("source IP %s and probe IP %s use different address families", sourceIP, targetIP)
+		}
+		dialer.LocalAddr = &net.TCPAddr{IP: sourceIP}
+	} else if interfaceOrIP != "" {
+		dialer.Control = func(network, address string, c syscall.RawConn) error {
+			return client.BindSocketToDevice(network, address, interfaceOrIP, c)
+		}
+	}
+
+	return dialer, nil
 }
 
 func haversine(lat1, lon1, lat2, lon2 float64) float64 {

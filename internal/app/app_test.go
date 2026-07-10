@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/idanyas/speedflare/internal/data"
 )
 
 type roundTripperFunc func(*http.Request) (*http.Response, error)
@@ -144,6 +146,18 @@ func TestUploadLiveSpeedEstimatorDampensShortBursts(t *testing.T) {
 	}
 }
 
+func TestBidirectionalModeRunsLatencyAndBothThroughputDirections(t *testing.T) {
+	if !TestModeBidirectional.runsLatency() {
+		t.Fatal("expected bidirectional mode to run latency")
+	}
+	if !TestModeBidirectional.runsDownload() {
+		t.Fatal("expected bidirectional mode to run download")
+	}
+	if !TestModeBidirectional.runsUpload() {
+		t.Fatal("expected bidirectional mode to run upload")
+	}
+}
+
 func TestUploadStreamCountsBytesRead(t *testing.T) {
 	recorder := newThroughputRecorder(time.Now(), 0, time.Second)
 	stream := newUploadStream(context.Background(), recorder, 32*1024)
@@ -246,6 +260,74 @@ func TestRunTestPassesTimeoutlessClientToWorker(t *testing.T) {
 		}
 	default:
 		t.Fatal("expected worker to observe throughput client")
+	}
+
+	if base.Timeout != 30*time.Second {
+		t.Fatalf("expected base client timeout to remain unchanged, got %v", base.Timeout)
+	}
+}
+
+func TestRunBidirectionalTestStartsBothDirectionsTogether(t *testing.T) {
+	base := &http.Client{
+		Transport: &http.Transport{},
+		Timeout:   30 * time.Second,
+	}
+
+	started := make(chan string, 2)
+	release := make(chan struct{})
+	worker := func(name string) throughputWorker {
+		return func(ctx context.Context, recorder *throughputRecorder, client *http.Client, continuous bool) {
+			if client.Timeout != 0 {
+				t.Errorf("%s worker received client timeout %v, want 0", name, client.Timeout)
+			}
+			started <- name
+			select {
+			case <-ctx.Done():
+				return
+			case <-release:
+				recorder.Add(128 * 1024)
+			}
+		}
+	}
+
+	type result struct {
+		download data.Speed
+		upload   data.Speed
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		download, upload := runBidirectionalTest(
+			worker("download"),
+			worker("upload"),
+			base,
+			false,
+			1,
+			true,
+		)
+		resultCh <- result{download: download, upload: upload}
+	}()
+
+	seen := make(map[string]bool)
+	for len(seen) < 2 {
+		select {
+		case name := <-started:
+			seen[name] = true
+		case <-time.After(time.Second):
+			t.Fatal("upload and download workers did not start concurrently")
+		}
+	}
+	close(release)
+
+	select {
+	case got := <-resultCh:
+		if got.download.DataMB <= 0 {
+			t.Fatalf("expected positive download data, got %.4f", got.download.DataMB)
+		}
+		if got.upload.DataMB <= 0 {
+			t.Fatalf("expected positive upload data, got %.4f", got.upload.DataMB)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("bidirectional test did not finish after workers completed")
 	}
 
 	if base.Timeout != 30*time.Second {

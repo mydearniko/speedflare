@@ -2,8 +2,6 @@ package location
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,52 +9,45 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strings"
 	"sync"
-	"syscall"
 	"time"
-
-	"github.com/gwatts/rootcerts"
 
 	"github.com/idanyas/speedflare/internal/client"
 )
 
-type ipapiResponse struct {
-	Location struct {
-		Latitude  float64 `json:"latitude"`
-		Longitude float64 `json:"longitude"`
-	} `json:"location"`
+type geoIPResponse struct {
+	IP        string  `json:"ip"`
+	Success   bool    `json:"success"`
+	Message   string  `json:"message"`
+	Latitude  float64 `json:"latitude"`
+	Longitude float64 `json:"longitude"`
 }
 
 var (
-	geoIPEndpoint    = "https://api.ipapi.is/"
-	geoIPAttempts    = 3
-	geoIPResolveHost = func(ctx context.Context, host string, rootCAs *x509.CertPool, interfaceName string) ([]net.IP, error) {
-		return client.ResolveHost(ctx, host, false, false, false, rootCAs, interfaceName)
-	}
-	geoIPTLSConfig = func(serverName string, rootCAs *x509.CertPool) *tls.Config {
-		return &tls.Config{
-			ServerName: serverName,
-			RootCAs:    rootCAs,
-		}
-	}
+	geoIPEndpoint = "https://ipwho.is/"
+	geoIPAttempts = 3
+	geoIPClient   = newGeoIPHTTPClient
 )
 
-// GetUserCoordinates performs parallel GeoIP requests and returns the first successful result.
-func GetUserCoordinates(interfaceName string) (float64, float64, error) {
+// GetUserCoordinates performs parallel GeoIP requests and returns the first
+// successful result. publicIP makes the lookup independent of the address
+// family used to reach the API, which is important on dual-stack systems.
+func GetUserCoordinates(interfaceOrIP, publicIP string, ipv4Only, ipv6Only bool, proxyAddress string) (float64, float64, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	endpoint, err := url.Parse(geoIPEndpoint)
-	if err != nil {
-		return 0, 0, fmt.Errorf("invalid geoip endpoint: %w", err)
-	}
-
-	httpClient, err := newGeoIPHTTPClient(endpoint, interfaceName)
+	endpoint, err := geoIPRequestURL(geoIPEndpoint, publicIP)
 	if err != nil {
 		return 0, 0, err
 	}
 
-	resultCh := make(chan ipapiResponse, 1)
+	httpClient, err := geoIPClient(ipv4Only, ipv6Only, interfaceOrIP, proxyAddress)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	resultCh := make(chan geoIPResponse, 1)
 	errCh := make(chan error, geoIPAttempts)
 	doneCh := make(chan struct{})
 
@@ -66,7 +57,7 @@ func GetUserCoordinates(interfaceName string) (float64, float64, error) {
 		go func() {
 			defer wg.Done()
 
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 			if err != nil {
 				errCh <- err
 				return
@@ -86,13 +77,21 @@ func GetUserCoordinates(interfaceName string) (float64, float64, error) {
 				return
 			}
 
-			var data ipapiResponse
+			var data geoIPResponse
 			if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 				errCh <- err
 				return
 			}
 
-			if data.Location.Latitude == 0 && data.Location.Longitude == 0 {
+			if !data.Success {
+				message := strings.TrimSpace(data.Message)
+				if message == "" {
+					message = "lookup was unsuccessful"
+				}
+				errCh <- errors.New(message)
+				return
+			}
+			if data.Latitude == 0 && data.Longitude == 0 {
 				errCh <- errors.New("zero coordinates received")
 				return
 			}
@@ -111,7 +110,7 @@ func GetUserCoordinates(interfaceName string) (float64, float64, error) {
 
 	select {
 	case res := <-resultCh:
-		return res.Location.Latitude, res.Location.Longitude, nil
+		return res.Latitude, res.Longitude, nil
 	case <-doneCh:
 		return 0, 0, collectGeoIPErrors(errCh, errors.New("geoip failed"))
 	case <-ctx.Done():
@@ -119,72 +118,36 @@ func GetUserCoordinates(interfaceName string) (float64, float64, error) {
 	}
 }
 
-func newGeoIPHTTPClient(endpoint *url.URL, interfaceName string) (*http.Client, error) {
-	rootCAs := rootcerts.ServerCertPool()
-	if rootCAs == nil {
-		return nil, errors.New("unable to obtain a valid root CA pool for GeoIP lookup")
+func geoIPRequestURL(rawEndpoint, publicIP string) (string, error) {
+	endpoint, err := url.Parse(rawEndpoint)
+	if err != nil {
+		return "", fmt.Errorf("invalid geoip endpoint: %w", err)
 	}
 
-	serverName := endpoint.Hostname()
-	baseDialer := &net.Dialer{
-		Timeout:   5 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}
-
-	if interfaceName != "" {
-		baseDialer.Control = func(network, address string, c syscall.RawConn) error {
-			return client.BindSocketToDevice(network, address, interfaceName, c)
+	publicIP = strings.TrimSpace(publicIP)
+	if publicIP != "" {
+		ip := net.ParseIP(publicIP)
+		if ip == nil {
+			return "", fmt.Errorf("invalid public IP for geoip lookup: %q", publicIP)
 		}
+		endpoint = endpoint.JoinPath(ip.String())
 	}
 
-	transport := &http.Transport{
-		DisableKeepAlives: true,
-		Proxy:             http.ProxyFromEnvironment,
-		TLSClientConfig:   geoIPTLSConfig(serverName, rootCAs),
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			host, port, err := net.SplitHostPort(addr)
-			if err != nil {
-				return nil, fmt.Errorf("invalid address format: %w", err)
-			}
+	query := endpoint.Query()
+	query.Set("fields", "success,message,ip,type,latitude,longitude")
+	endpoint.RawQuery = query.Encode()
+	return endpoint.String(), nil
+}
 
-			ips, err := geoIPResolveHost(ctx, host, rootCAs, interfaceName)
-			if err != nil {
-				return nil, fmt.Errorf("DNS resolution failed for %s: %w", host, err)
-			}
-			if len(ips) == 0 {
-				return nil, fmt.Errorf("DNS resolution failed: no usable IPs returned for %s", host)
-			}
-
-			var firstDialErr error
-			for _, ip := range ips {
-				dialNetwork := "tcp6"
-				if ip.To4() != nil {
-					dialNetwork = "tcp4"
-				}
-
-				dialCtx, dialCancel := context.WithTimeout(ctx, 2*time.Second)
-				conn, dialErr := baseDialer.DialContext(dialCtx, dialNetwork, net.JoinHostPort(ip.String(), port))
-				dialCancel()
-
-				if dialErr == nil {
-					return conn, nil
-				}
-				if firstDialErr == nil {
-					firstDialErr = dialErr
-				}
-			}
-
-			return nil, fmt.Errorf("connection failed to all resolved IPs for %s:%s (first error: %v)", host, port, firstDialErr)
-		},
-		ForceAttemptHTTP2:     true,
-		TLSHandshakeTimeout:   5 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
+func newGeoIPHTTPClient(ipv4Only, ipv6Only bool, interfaceOrIP, proxyAddress string) (*http.Client, error) {
+	httpClient, err := client.NewHTTPClient(ipv4Only, ipv6Only, interfaceOrIP, false, "", proxyAddress)
+	if err != nil {
+		return nil, fmt.Errorf("creating GeoIP client: %w", err)
 	}
 
-	return &http.Client{
-		Transport: transport,
-		Timeout:   8 * time.Second,
-	}, nil
+	clone := *httpClient
+	clone.Timeout = 8 * time.Second
+	return &clone, nil
 }
 
 func collectGeoIPErrors(errCh <-chan error, fallback error) error {

@@ -52,6 +52,7 @@ const (
 	TestModeUploadOnly
 	TestModeDownloadOnly
 	TestModeLatencyOnly
+	TestModeBidirectional
 )
 
 type RunOptions struct {
@@ -356,15 +357,15 @@ func (e *liveSpeedEstimator) rollingMbps(now time.Time, totalBytes int64) (float
 }
 
 func (m TestMode) runsLatency() bool {
-	return m == TestModeDefault || m == TestModeLatencyOnly
+	return m == TestModeDefault || m == TestModeLatencyOnly || m == TestModeBidirectional
 }
 
 func (m TestMode) runsDownload() bool {
-	return m == TestModeDefault || m == TestModeDownloadOnly
+	return m == TestModeDefault || m == TestModeDownloadOnly || m == TestModeBidirectional
 }
 
 func (m TestMode) runsUpload() bool {
-	return m == TestModeDefault || m == TestModeUploadOnly
+	return m == TestModeDefault || m == TestModeUploadOnly || m == TestModeBidirectional
 }
 
 func RunSpeedTest(client *http.Client, opts RunOptions) (*data.TestResult, error) {
@@ -413,6 +414,17 @@ func RunSpeedTest(client *http.Client, opts RunOptions) (*data.TestResult, error
 	}
 
 	if opts.Mode == TestModeLatencyOnly {
+		return result, nil
+	}
+	if opts.Mode == TestModeBidirectional {
+		result.Download, result.Upload = runBidirectionalTest(
+			downloadWorker,
+			uploadWorker,
+			client,
+			!opts.SingleConnection,
+			opts.Workers,
+			opts.JSONOutput,
+		)
 		return result, nil
 	}
 
@@ -571,7 +583,9 @@ func summarizeLatencies(latencies []float64) *data.LatencyResult {
 	}
 }
 
-func runTest(name string, worker func(context.Context, *throughputRecorder, *http.Client, bool), client *http.Client, multiple bool, workers int, jsonOutput bool, continuous bool) data.Speed {
+type throughputWorker func(context.Context, *throughputRecorder, *http.Client, bool)
+
+func runTest(name string, worker throughputWorker, client *http.Client, multiple bool, workers int, jsonOutput bool, continuous bool) data.Speed {
 	client = throughputClient(client)
 
 	start := time.Now()
@@ -621,22 +635,7 @@ func runTest(name string, worker func(context.Context, *throughputRecorder, *htt
 	}
 
 	if !continuous {
-		go func() {
-			select {
-			case <-ctx.Done():
-				return
-			case <-recorder.firstByteCh:
-			}
-
-			timer := time.NewTimer(speedTestWarmup + speedTestMeasure)
-			defer timer.Stop()
-
-			select {
-			case <-ctx.Done():
-			case <-timer.C:
-				cancel()
-			}
-		}()
+		go cancelAfterMeasurement(ctx, recorder, cancel)
 	}
 
 	go func() {
@@ -665,6 +664,122 @@ func runTest(name string, worker func(context.Context, *throughputRecorder, *htt
 		Mbps:   summary.mbps,
 		DataMB: summary.dataMB,
 	}
+}
+
+func cancelAfterMeasurement(ctx context.Context, recorder *throughputRecorder, cancel context.CancelFunc) {
+	select {
+	case <-ctx.Done():
+		return
+	case <-recorder.firstByteCh:
+	}
+
+	timer := time.NewTimer(recorder.warmup + recorder.measure)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
+		cancel()
+	}
+}
+
+func runBidirectionalTest(download, upload throughputWorker, client *http.Client, multiple bool, workers int, jsonOutput bool) (data.Speed, data.Speed) {
+	client = throughputClient(client)
+
+	start := time.Now()
+	downloadRecorder := newThroughputRecorder(start, speedTestWarmup, speedTestMeasure)
+	uploadRecorder := newThroughputRecorder(start, speedTestWarmup, speedTestMeasure)
+	downloadEstimator := newLiveSpeedEstimatorWithConfig(downloadRecorder, defaultLiveSpeedEstimatorConfig)
+	uploadEstimator := newLiveSpeedEstimatorWithConfig(uploadRecorder, uploadLiveSpeedEstimatorConfig)
+
+	parentCtx, parentCancel := context.WithTimeout(context.Background(), speedTestHardTimeout)
+	defer parentCancel()
+
+	downloadCtx, downloadCancel := context.WithCancel(parentCtx)
+	uploadCtx, uploadCancel := context.WithCancel(parentCtx)
+	defer downloadCancel()
+	defer uploadCancel()
+
+	go cancelAfterMeasurement(downloadCtx, downloadRecorder, downloadCancel)
+	go cancelAfterMeasurement(uploadCtx, uploadRecorder, uploadCancel)
+
+	numWorkers := 1
+	if multiple {
+		numWorkers = workers
+	}
+
+	startWorkers := make(chan struct{})
+	downloadDone := runThroughputWorkers(startWorkers, downloadCtx, downloadCancel, downloadRecorder, client, download, numWorkers)
+	uploadDone := runThroughputWorkers(startWorkers, uploadCtx, uploadCancel, uploadRecorder, client, upload, numWorkers)
+	close(startWorkers)
+
+	done := make(chan struct{})
+	go func() {
+		<-downloadDone
+		<-uploadDone
+		close(done)
+	}()
+
+	go output.ProgressReporter("Bidirectional:", done, jsonOutput, func() string {
+		return fmt.Sprintf(
+			"Download %.2f Mbps | Upload %.2f Mbps",
+			downloadEstimator.current(time.Now()),
+			uploadEstimator.current(time.Now()),
+		)
+	})
+
+	<-done
+	now := time.Now()
+	downloadSummary := downloadRecorder.summarize(now)
+	uploadSummary := uploadRecorder.summarize(now)
+
+	if !jsonOutput {
+		green := color.New(color.FgGreen).SprintFunc()
+		fmt.Printf("\r\033[K%s Download: %.2f Mbps (Used: %.2f MB)\n",
+			green("✓"),
+			downloadSummary.mbps,
+			downloadSummary.dataMB,
+		)
+		fmt.Printf("%s Upload: %.2f Mbps (Used: %.2f MB)\n",
+			green("✓"),
+			uploadSummary.mbps,
+			uploadSummary.dataMB,
+		)
+	}
+
+	return data.Speed{
+			Mbps:   downloadSummary.mbps,
+			DataMB: downloadSummary.dataMB,
+		}, data.Speed{
+			Mbps:   uploadSummary.mbps,
+			DataMB: uploadSummary.dataMB,
+		}
+}
+
+func runThroughputWorkers(start <-chan struct{}, ctx context.Context, cancel context.CancelFunc, recorder *throughputRecorder, client *http.Client, worker throughputWorker, workers int) <-chan struct{} {
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case <-ctx.Done():
+				return
+			case <-start:
+			}
+			worker(ctx, recorder, client, false)
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		cancel()
+		close(done)
+	}()
+
+	return done
 }
 
 func liveSpeedConfigForTest(name string) liveSpeedEstimatorConfig {

@@ -24,7 +24,9 @@ import (
 
 // BrowserTransport wraps an http.RoundTripper and adds browser-mimicking headers.
 type BrowserTransport struct {
-	Transport *http.Transport
+	Transport     *http.Transport
+	OriginIP      string
+	RewriteOrigin bool
 }
 
 type dialTarget struct {
@@ -99,25 +101,26 @@ func EffectiveProxyURL(proxyAddress, targetURL string) (*url.URL, error) {
 	return proxy(req)
 }
 
-func effectiveProxyDialHost(proxy func(*http.Request) (*url.URL, error), targetURL string) (string, error) {
+func effectiveProxyURL(proxy func(*http.Request) (*url.URL, error), targetURL string) (*url.URL, error) {
 	req, err := http.NewRequest(http.MethodGet, targetURL, nil)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	proxyURL, err := proxy(req)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	if proxyURL == nil {
-		return "", nil
-	}
-
-	return proxyURL.Hostname(), nil
+	return proxyURL, nil
 }
 
 func (t *BrowserTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	clone := req.Clone(req.Context())
+	if t.RewriteOrigin {
+		if err := rewriteRequestForOrigin(clone, t.OriginIP); err != nil {
+			return nil, err
+		}
+	}
 
 	if clone.Header.Get("User-Agent") == "" {
 		clone.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -128,6 +131,35 @@ func (t *BrowserTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	clone.Header.Set("Cache-Control", "no-cache")
 
 	return t.Transport.RoundTrip(clone)
+}
+
+func rewriteRequestForOrigin(req *http.Request, originIP string) error {
+	if originIP == "" || req == nil || req.URL == nil || !strings.EqualFold(req.URL.Hostname(), "speed.cloudflare.com") {
+		return nil
+	}
+
+	ip := net.ParseIP(originIP)
+	if ip == nil {
+		return fmt.Errorf("invalid origin IP: %s", originIP)
+	}
+
+	hostHeader := req.Host
+	if hostHeader == "" {
+		hostHeader = req.URL.Host
+	}
+	port := req.URL.Port()
+	if port == "" {
+		switch req.URL.Scheme {
+		case "http":
+			port = "80"
+		default:
+			port = "443"
+		}
+	}
+
+	req.URL.Host = net.JoinHostPort(ip.String(), port)
+	req.Host = hostHeader
+	return nil
 }
 
 func (l *localAddrs) hasIPv4() bool {
@@ -362,9 +394,19 @@ func NewHTTPClient(ipv4OnlyFlag, ipv6OnlyFlag bool, interfaceOrIP string, insecu
 	if err != nil {
 		return nil, err
 	}
-	proxyDialHost, err := effectiveProxyDialHost(proxy, "https://speed.cloudflare.com/")
+	speedProxyURL, err := effectiveProxyURL(proxy, "https://speed.cloudflare.com/")
 	if err != nil {
 		return nil, err
+	}
+	proxyDialHost := ""
+	transportProxy := proxy
+	if speedProxyURL != nil {
+		proxyDialHost = speedProxyURL.Hostname()
+		if originIP != "" {
+			// Origin rewriting changes the request URL to an IP. Keep the proxy
+			// decision made for speed.cloudflare.com (including NO_PROXY rules).
+			transportProxy = http.ProxyURL(speedProxyURL)
+		}
 	}
 
 	originDialTarget, err := buildOriginDialTarget(originIP, localAddrs, ipv4OnlyFlag, ipv6OnlyFlag)
@@ -380,6 +422,9 @@ func NewHTTPClient(ipv4OnlyFlag, ipv6OnlyFlag bool, interfaceOrIP string, insecu
 	tlsClientConfig := &tls.Config{
 		InsecureSkipVerify: insecureSkipVerify,
 	}
+	if originIP != "" {
+		tlsClientConfig.ServerName = "speed.cloudflare.com"
+	}
 
 	if !insecureSkipVerify {
 		tlsClientConfig.RootCAs = rootcerts.ServerCertPool()
@@ -393,7 +438,7 @@ func NewHTTPClient(ipv4OnlyFlag, ipv6OnlyFlag bool, interfaceOrIP string, insecu
 	}
 
 	transport := &http.Transport{
-		Proxy: proxy,
+		Proxy: transportProxy,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			dialWithLocalAddr := func(ctx context.Context, network, addr string, localAddr net.Addr) (net.Conn, error) {
 				dialer := *baseDialer
@@ -406,12 +451,20 @@ func NewHTTPClient(ipv4OnlyFlag, ipv6OnlyFlag bool, interfaceOrIP string, insecu
 				return dialer.DialContext(ctx, network, addr)
 			}
 
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, fmt.Errorf("invalid address format: %w", err)
+			}
+			isProxyDial := proxyDialHost != "" && strings.EqualFold(host, proxyDialHost)
+
 			// Explicit origin IP override: bypass DNS for speed.cloudflare.com.
-			if originDialTarget != nil {
-				_, port, err := net.SplitHostPort(addr)
-				if err != nil {
-					return nil, fmt.Errorf("invalid address format: %w", err)
-				}
+			// When a proxy is active, addr is the proxy and must not be replaced.
+			addrIP := net.ParseIP(host)
+			originIPMatch := false
+			if originDialTarget != nil && addrIP != nil {
+				originIPMatch = addrIP.Equal(net.ParseIP(originDialTarget.ip))
+			}
+			if originDialTarget != nil && !isProxyDial && (strings.EqualFold(host, "speed.cloudflare.com") || originIPMatch) {
 
 				targetIP := net.ParseIP(originDialTarget.ip)
 				localAddr := localAddrs.addrForIP(targetIP)
@@ -424,10 +477,10 @@ func NewHTTPClient(ipv4OnlyFlag, ipv6OnlyFlag bool, interfaceOrIP string, insecu
 
 			// Standard Logic
 			currentIpv4Only, currentIpv6Only, networkPreference := localAddrs.resolveNetworkPreference(ipv4OnlyFlag, ipv6OnlyFlag)
-
-			host, port, err := net.SplitHostPort(addr)
-			if err != nil {
-				return nil, fmt.Errorf("invalid address format: %w", err)
+			if isProxyDial {
+				// IPv4/IPv6 flags select the Cloudflare target family, not the
+				// address family used for the local hop to a proxy.
+				currentIpv4Only, currentIpv6Only, networkPreference = localAddrs.resolveNetworkPreference(false, false)
 			}
 
 			if ip := net.ParseIP(host); ip != nil {
@@ -452,7 +505,7 @@ func NewHTTPClient(ipv4OnlyFlag, ipv6OnlyFlag bool, interfaceOrIP string, insecu
 				return conn, nil
 			}
 
-			allowLoopback := proxyDialHost != "" && strings.EqualFold(host, proxyDialHost)
+			allowLoopback := isProxyDial
 			resolvedIPs, resolveErr := resolveHost(ctx, host, currentIpv4Only, currentIpv6Only, insecureSkipVerify, tlsClientConfig.RootCAs, localAddrs.getInterfaceName(), allowLoopback)
 			if resolveErr != nil {
 				return nil, fmt.Errorf("DNS resolution failed for %s: %w", host, resolveErr)
@@ -506,10 +559,36 @@ func NewHTTPClient(ipv4OnlyFlag, ipv6OnlyFlag bool, interfaceOrIP string, insecu
 		ForceAttemptHTTP2:     true,
 		TLSClientConfig:       tlsClientConfig,
 	}
+	if originIP != "" && speedProxyURL != nil && strings.EqualFold(speedProxyURL.Scheme, "https") {
+		baseDialContext := transport.DialContext
+		transport.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := baseDialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			host, _, err := net.SplitHostPort(addr)
+			if err != nil {
+				conn.Close()
+				return nil, err
+			}
+			proxyTLSConfig := tlsClientConfig.Clone()
+			proxyTLSConfig.ServerName = host
+			tlsConn := tls.Client(conn, proxyTLSConfig)
+			if err := tlsConn.HandshakeContext(ctx); err != nil {
+				conn.Close()
+				return nil, err
+			}
+			return tlsConn, nil
+		}
+	}
 
 	return &http.Client{
-		Transport: &BrowserTransport{Transport: transport},
-		Timeout:   30 * time.Second,
+		Transport: &BrowserTransport{
+			Transport:     transport,
+			OriginIP:      originIP,
+			RewriteOrigin: originIP != "" && speedProxyURL != nil,
+		},
+		Timeout: 30 * time.Second,
 	}, nil
 }
 
