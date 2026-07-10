@@ -71,24 +71,28 @@ That makes it useful for:
 ## Features
 
 - **Cloudflare speed test CLI**: Measures network performance using Cloudflare's global edge network.
-- **PoP and routing diagnostics**: Detects your current Cloudflare Point of Presence and can probe alternate IPv4 datacenters.
+- **PoP and routing diagnostics**: Detects your current Cloudflare Point of Presence and can probe alternate IPv4 or IPv6 datacenters.
 - **Interactive datacenter selection**: Offers nearby or country-preferred Cloudflare colos when multiple options are reachable.
 - **Latency and jitter metrics**: Reports average, jitter, minimum, and maximum latency.
 - **Download and upload throughput**: Supports multi-worker and single-connection tests.
 - **IPv4 and IPv6 control**: Force IPv4-only or IPv6-only tests from the terminal.
 - **Source interface control**: Test from a specific network interface or source IP with `--interface`.
-- **Proxy support**: Route tests through an explicit HTTP, HTTPS, SOCKS5, or SOCKS5H proxy with `--proxy`.
+- **Proxy support**: Route speed tests and colo detection through an explicit HTTP, HTTPS, SOCKS5, or SOCKS5H proxy with `--proxy`.
 - **JSON output**: Use `--json` for automation and monitoring integrations.
-- **Targeted test modes**: Run download-only, upload-only, latency-only, or continuous throughput tests.
+- **Targeted test modes**: Run download-only, upload-only, latency-only, simultaneous bidirectional, or continuous throughput tests.
 - **Privacy option**: Hide your IP address in terminal output with `--hide-ip`.
 
 ## How It Works
 
 1. **Trace Cloudflare routing**: speedflare connects to Cloudflare to identify your current PoP/colo.
-2. **Estimate location**: It can query `api.ipapi.is` to estimate your location for practical distance calculations.
-3. **Probe alternate colos**: In IPv4 mode, it checks Cloudflare anycast ranges to discover reachable datacenters.
+2. **Estimate location**: It can query the dual-stack `ipwho.is` API to estimate your IPv4 or IPv6 location for practical distance calculations.
+3. **Probe alternate colos**: It checks bounded IPv4 targets or active IPv6 CDN ingress ranges to discover reachable datacenters for the connection's address family.
 4. **Select a datacenter**: If multiple Cloudflare colos are found, speedflare can show an interactive selection sorted by distance and country preference.
 5. **Measure performance**: It runs latency tests followed by parallel download and upload streams.
+
+### IPv6 Colo Discovery
+
+Cloudflare's published IPv6 allocations are too large for useful random sampling. In IPv6 mode, speedflare instead combines the current `speed.cloudflare.com` AAAA records with more than 100 narrow `/48` CDN ingress ranges derived from active Cloudflare address layouts and the [CloudflareSpeedTest IPv6 hitlist](https://github.com/XIU2/CloudflareSpeedTest/blob/master/ipv6.txt). Each candidate is verified over HTTPS using `speed.cloudflare.com` SNI and is accepted only when `/cdn-cgi/trace` returns a valid `colo` value.
 
 ## Examples
 
@@ -106,11 +110,15 @@ speedflare --origin-ip 104.16.177.1
 # Route the test through a proxy
 speedflare --proxy http://127.0.0.1:8080
 speedflare --proxy socks5h://127.0.0.1:1080
+speedflare --ipv6 --proxy socks5h://127.0.0.1:1080
 
 # Run only one part of the test
 speedflare --latency-only
 speedflare --download-only
 speedflare --upload-only
+
+# Measure upload and download at the same time
+speedflare --bidirectional
 
 # Continuous throughput test until interrupted
 speedflare --download-only --continuous
@@ -174,9 +182,10 @@ Example output:
   -U, --upload-only       Run only the upload test.
   -D, --download-only     Run only the download test.
   -L, --latency-only      Run only the latency test.
+  -B, --bidirectional     Run upload and download tests at the same time.
   -C, --continuous        Run upload-only or download-only continuously until interrupted.
   -w, --workers           Number of workers for multithreaded speed tests (default: 6).
-      --198               Use only 198.41.192.0/21 and 198.41.200.0/21 for datacenter probing.
+      --198               Use only 198.41.192.0/21 and 198.41.200.0/21 for IPv4 datacenter probing.
       --insecure          Skip TLS certificate verification (UNSAFE).
       --hide-ip           Hide the IP address in output.
 ```
@@ -184,9 +193,9 @@ Example output:
 ## Privacy and External Services
 
 - **Speed test traffic**: By default, generated directly between your machine and `speed.cloudflare.com`.
-- **Proxy traffic**: When `--proxy` or standard proxy environment variables are configured, HTTP(S) test traffic is routed through that proxy and direct datacenter probing is skipped.
+- **Proxy traffic**: When `--proxy` or standard proxy environment variables apply to `speed.cloudflare.com`, speed tests and colo probes are routed through that proxy. Colo detection asks the proxy to connect to candidate Cloudflare IP addresses while preserving `speed.cloudflare.com` as TLS SNI and HTTP Host.
 - **Cloudflare trace and location metadata**: Used to identify the Cloudflare PoP/colo serving your connection.
-- **Geolocation lookup**: speedflare may make a GET request to `https://api.ipapi.is` to estimate latitude and longitude for datacenter distance calculations.
+- **Geolocation lookup**: speedflare may make a GET request to `https://ipwho.is` to estimate latitude and longitude for datacenter distance calculations. The tested public IPv4 or IPv6 address is included in the request path.
 - **Local storage**: speedflare does not store personal data.
 
 ## Related Search Terms
