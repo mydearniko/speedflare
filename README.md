@@ -75,6 +75,7 @@ That makes it useful for:
 - **Interactive datacenter selection**: Offers nearby or country-preferred Cloudflare colos when multiple options are reachable.
 - **Latency and jitter metrics**: Reports average, jitter, minimum, and maximum latency.
 - **Download and upload throughput**: Supports multi-worker and single-connection tests.
+- **Aggregate bandwidth limits**: Cap download and upload throughput independently across all workers.
 - **IPv4 and IPv6 control**: Force IPv4-only or IPv6-only tests from the terminal.
 - **Source interface control**: Test from a specific network interface or source IP with `--interface`.
 - **Proxy support**: Route speed tests and colo detection through an explicit HTTP, HTTPS, SOCKS5, or SOCKS5H proxy with `--proxy`.
@@ -120,9 +121,14 @@ speedflare --upload-only
 # Measure upload and download at the same time
 speedflare --bidirectional
 
+# Cap aggregate download and upload throughput in Mbps
+speedflare --download-limit 100 --upload-limit 25
+speedflare -B -C -d 100 -u 25
+
 # Continuous throughput test until interrupted
 speedflare --download-only --continuous
 speedflare --upload-only --continuous
+speedflare --bidirectional --continuous
 
 # List Cloudflare server locations
 speedflare --list
@@ -183,7 +189,9 @@ Example output:
   -D, --download-only     Run only the download test.
   -L, --latency-only      Run only the latency test.
   -B, --bidirectional     Run upload and download tests at the same time.
-  -C, --continuous        Run upload-only or download-only continuously until interrupted.
+  -C, --continuous        Run upload-only, download-only, or bidirectional continuously until interrupted.
+  -d, --download-limit    Limit aggregate download speed in Mbps (default: unlimited).
+  -u, --upload-limit      Limit aggregate upload speed in Mbps (default: unlimited).
   -w, --workers           Number of workers for multithreaded speed tests (default: 6).
       --198               Use only 198.41.192.0/21 and 198.41.200.0/21 for IPv4 datacenter probing.
       --insecure          Skip TLS certificate verification (UNSAFE).
