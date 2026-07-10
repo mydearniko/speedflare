@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"strings"
@@ -30,7 +31,9 @@ var (
 	downloadOnly     = pflag.BoolP("download-only", "D", false, "Run only the download test.")
 	latencyOnly      = pflag.BoolP("latency-only", "L", false, "Run only the latency test.")
 	bidirectional    = pflag.BoolP("bidirectional", "B", false, "Run upload and download tests at the same time.")
-	continuous       = pflag.BoolP("continuous", "C", false, "Run upload-only or download-only continuously until interrupted.")
+	continuous       = pflag.BoolP("continuous", "C", false, "Run upload-only, download-only, or bidirectional continuously until interrupted.")
+	downloadLimit    = pflag.Float64P("download-limit", "d", 0, "Limit aggregate download speed in Mbps (0 = unlimited).")
+	uploadLimit      = pflag.Float64P("upload-limit", "u", 0, "Limit aggregate upload speed in Mbps (0 = unlimited).")
 	workers          = pflag.IntP("workers", "w", 6, "Number of workers for multithreaded speedtests.")
 	insecure         = pflag.Bool("insecure", false, "Skip TLS certificate verification (UNSAFE).")
 	hideIP           = pflag.Bool("hide-ip", false, "Hide the IP address in output.")
@@ -73,8 +76,15 @@ func validateContinuousFlag(mode app.TestMode, enabled bool) error {
 	if !enabled {
 		return nil
 	}
-	if mode != app.TestModeUploadOnly && mode != app.TestModeDownloadOnly {
-		return fmt.Errorf("--continuous (-C) requires --upload-only (-U) or --download-only (-D)")
+	if mode != app.TestModeUploadOnly && mode != app.TestModeDownloadOnly && mode != app.TestModeBidirectional {
+		return fmt.Errorf("--continuous (-C) requires --upload-only (-U), --download-only (-D), or --bidirectional (-B)")
+	}
+	return nil
+}
+
+func validateSpeedLimit(name string, mbps float64) error {
+	if math.IsNaN(mbps) || math.IsInf(mbps, 0) || mbps < 0 {
+		return fmt.Errorf("--%s must be a finite, non-negative number of Mbps", name)
 	}
 	return nil
 }
@@ -122,6 +132,14 @@ func main() {
 		os.Exit(2)
 	}
 	if err := validateContinuousFlag(mode, *continuous); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v.\n", err)
+		os.Exit(2)
+	}
+	if err := validateSpeedLimit("download-limit (-d)", *downloadLimit); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v.\n", err)
+		os.Exit(2)
+	}
+	if err := validateSpeedLimit("upload-limit (-u)", *uploadLimit); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v.\n", err)
 		os.Exit(2)
 	}
@@ -250,15 +268,17 @@ func main() {
 
 	// Run the speed test
 	results, err := app.RunSpeedTest(httpClient, app.RunOptions{
-		LatencyAttempts:  *latencyAttempts,
-		Workers:          *workers,
-		SingleConnection: *singleConnection,
-		JSONOutput:       *jsonOutput,
-		SuppressIntro:    suppressIntro,
-		HideIP:           *hideIP,
-		OriginIP:         selectedOriginIP,
-		Mode:             mode,
-		Continuous:       *continuous,
+		LatencyAttempts:   *latencyAttempts,
+		Workers:           *workers,
+		SingleConnection:  *singleConnection,
+		JSONOutput:        *jsonOutput,
+		SuppressIntro:     suppressIntro,
+		HideIP:            *hideIP,
+		OriginIP:          selectedOriginIP,
+		Mode:              mode,
+		Continuous:        *continuous,
+		DownloadLimitMbps: *downloadLimit,
+		UploadLimitMbps:   *uploadLimit,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error during speed test: %v\n", err)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math"
 	"testing"
 
 	"github.com/idanyas/speedflare/internal/app"
@@ -92,6 +93,34 @@ func TestResolveTestMode(t *testing.T) {
 	}
 }
 
+func TestValidateSpeedLimit(t *testing.T) {
+	tests := []struct {
+		name      string
+		value     float64
+		wantError bool
+	}{
+		{name: "unlimited"},
+		{name: "fractional", value: 0.25},
+		{name: "high", value: 100_000},
+		{name: "negative", value: -1, wantError: true},
+		{name: "nan", value: math.NaN(), wantError: true},
+		{name: "positive infinity", value: math.Inf(1), wantError: true},
+		{name: "negative infinity", value: math.Inf(-1), wantError: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateSpeedLimit("download-limit (-d)", tt.value)
+			if tt.wantError && err == nil {
+				t.Fatal("expected an error, got nil")
+			}
+			if !tt.wantError && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
 func TestValidateContinuousFlag(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -127,10 +156,9 @@ func TestValidateContinuousFlag(t *testing.T) {
 			wantError: true,
 		},
 		{
-			name:      "bidirectional mode rejected",
-			mode:      app.TestModeBidirectional,
-			enabled:   true,
-			wantError: true,
+			name:    "bidirectional",
+			mode:    app.TestModeBidirectional,
+			enabled: true,
 		},
 	}
 

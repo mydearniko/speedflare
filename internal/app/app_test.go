@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -160,7 +161,7 @@ func TestBidirectionalModeRunsLatencyAndBothThroughputDirections(t *testing.T) {
 
 func TestUploadStreamCountsBytesRead(t *testing.T) {
 	recorder := newThroughputRecorder(time.Now(), 0, time.Second)
-	stream := newUploadStream(context.Background(), recorder, 32*1024)
+	stream := newUploadStream(context.Background(), recorder, 32*1024, nil)
 	buf := make([]byte, 32*1024)
 
 	n, err := stream.Read(buf)
@@ -181,7 +182,7 @@ func TestUploadStreamCountsBytesRead(t *testing.T) {
 
 func TestUploadStreamStopsAtConfiguredSize(t *testing.T) {
 	recorder := newThroughputRecorder(time.Now(), 0, time.Second)
-	stream := newUploadStream(context.Background(), recorder, 40*1024)
+	stream := newUploadStream(context.Background(), recorder, 40*1024, nil)
 	buf := make([]byte, 32*1024)
 
 	n, err := stream.Read(buf)
@@ -206,6 +207,29 @@ func TestUploadStreamStopsAtConfiguredSize(t *testing.T) {
 	}
 	if got, want := recorder.totalBytes.Load(), int64(40*1024); got != want {
 		t.Fatalf("total bytes mismatch: got %d want %d", got, want)
+	}
+}
+
+func TestUploadStreamStopsBeforeRecordingWhenLimitWaitIsCanceled(t *testing.T) {
+	recorder := newThroughputRecorder(time.Now(), 0, time.Second)
+	limiter := newBandwidthLimiter(0.008) // 1 KB/s
+	ctx, cancel := context.WithCancel(context.Background())
+	stream := newUploadStream(ctx, recorder, 32*1024, limiter)
+	buf := make([]byte, 32*1024)
+
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+	n, err := stream.Read(buf)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context cancellation, got n=%d err=%v", n, err)
+	}
+	if n != 0 {
+		t.Fatalf("expected no bytes after canceled limiter wait, got %d", n)
+	}
+	if got := recorder.totalBytes.Load(); got != 0 {
+		t.Fatalf("expected canceled bytes not to be recorded, got %d", got)
 	}
 }
 
@@ -248,10 +272,10 @@ func TestRunTestPassesTimeoutlessClientToWorker(t *testing.T) {
 	}
 
 	observedTimeout := make(chan time.Duration, 1)
-	runTest("Upload:", func(ctx context.Context, recorder *throughputRecorder, client *http.Client, continuous bool) {
+	runTest("Upload:", func(ctx context.Context, recorder *throughputRecorder, client *http.Client, continuous bool, limiter *bandwidthLimiter) {
 		observedTimeout <- client.Timeout
 		recorder.Add(128 * 1024)
-	}, base, false, 1, true, false)
+	}, base, false, 1, true, false, 0)
 
 	select {
 	case got := <-observedTimeout:
@@ -267,6 +291,32 @@ func TestRunTestPassesTimeoutlessClientToWorker(t *testing.T) {
 	}
 }
 
+func TestRunTestSharesOneBandwidthLimiterAcrossWorkers(t *testing.T) {
+	base := &http.Client{Transport: &http.Transport{}}
+	observed := make(chan *bandwidthLimiter, 3)
+
+	runTest("Download:", func(ctx context.Context, recorder *throughputRecorder, client *http.Client, continuous bool, limiter *bandwidthLimiter) {
+		observed <- limiter
+		recorder.Add(128 * 1024)
+	}, base, true, 3, true, false, 40)
+
+	var shared *bandwidthLimiter
+	for range 3 {
+		limiter := <-observed
+		if limiter == nil {
+			t.Fatal("expected a configured limiter")
+		}
+		if shared == nil {
+			shared = limiter
+		} else if limiter != shared {
+			t.Fatal("expected all workers to share one aggregate limiter")
+		}
+	}
+	if got, want := shared.bytesPerSecond, 5_000_000.0; got != want {
+		t.Fatalf("limiter rate mismatch: got %.0f bytes/s want %.0f", got, want)
+	}
+}
+
 func TestRunBidirectionalTestStartsBothDirectionsTogether(t *testing.T) {
 	base := &http.Client{
 		Transport: &http.Transport{},
@@ -276,7 +326,7 @@ func TestRunBidirectionalTestStartsBothDirectionsTogether(t *testing.T) {
 	started := make(chan string, 2)
 	release := make(chan struct{})
 	worker := func(name string) throughputWorker {
-		return func(ctx context.Context, recorder *throughputRecorder, client *http.Client, continuous bool) {
+		return func(ctx context.Context, recorder *throughputRecorder, client *http.Client, continuous bool, limiter *bandwidthLimiter) {
 			if client.Timeout != 0 {
 				t.Errorf("%s worker received client timeout %v, want 0", name, client.Timeout)
 			}
@@ -303,6 +353,9 @@ func TestRunBidirectionalTestStartsBothDirectionsTogether(t *testing.T) {
 			false,
 			1,
 			true,
+			false,
+			0,
+			0,
 		)
 		resultCh <- result{download: download, upload: upload}
 	}()
@@ -332,6 +385,62 @@ func TestRunBidirectionalTestStartsBothDirectionsTogether(t *testing.T) {
 
 	if base.Timeout != 30*time.Second {
 		t.Fatalf("expected base client timeout to remain unchanged, got %v", base.Timeout)
+	}
+}
+
+func TestRunBidirectionalTestSupportsContinuousMode(t *testing.T) {
+	base := &http.Client{
+		Transport: &http.Transport{},
+		Timeout:   30 * time.Second,
+	}
+
+	observed := make(chan string, 2)
+	worker := func(name string) throughputWorker {
+		return func(ctx context.Context, recorder *throughputRecorder, client *http.Client, continuous bool, limiter *bandwidthLimiter) {
+			if !continuous {
+				t.Errorf("%s worker did not receive continuous mode", name)
+			}
+			if recorder.measure != 0 {
+				t.Errorf("%s recorder measure window = %v, want unlimited", name, recorder.measure)
+			}
+			wantBytesPerSecond := map[string]float64{
+				"download": 10_000_000,
+				"upload":   2_500_000,
+			}[name]
+			if limiter == nil || limiter.bytesPerSecond != wantBytesPerSecond {
+				t.Errorf("%s limiter = %#v, want %.0f bytes/s", name, limiter, wantBytesPerSecond)
+			}
+			recorder.Add(128 * 1024)
+			observed <- name
+		}
+	}
+
+	download, upload := runBidirectionalTest(
+		worker("download"),
+		worker("upload"),
+		base,
+		false,
+		1,
+		true,
+		true,
+		80,
+		20,
+	)
+
+	if download.DataMB <= 0 || upload.DataMB <= 0 {
+		t.Fatalf("expected data from both directions, got download %.4f MB upload %.4f MB", download.DataMB, upload.DataMB)
+	}
+	seen := map[string]bool{}
+	for range 2 {
+		select {
+		case name := <-observed:
+			seen[name] = true
+		default:
+			t.Fatal("expected both continuous workers to run")
+		}
+	}
+	if !seen["download"] || !seen["upload"] {
+		t.Fatalf("expected both directions, got %v", seen)
 	}
 }
 
@@ -414,7 +523,7 @@ func TestDownloadWorkerRestartsRequestsUntilContextCanceled(t *testing.T) {
 		}),
 	}
 
-	downloadWorker(ctx, recorder, client, true)
+	downloadWorker(ctx, recorder, client, true, nil)
 
 	if got, want := atomic.LoadInt32(&calls), int32(3); got != want {
 		t.Fatalf("request count mismatch: got %d want %d", got, want)
@@ -457,7 +566,7 @@ func TestUploadWorkerRestartsRequestsUntilContextCanceled(t *testing.T) {
 		}),
 	}
 
-	uploadWorker(ctx, recorder, client, true)
+	uploadWorker(ctx, recorder, client, true, nil)
 
 	if got, want := atomic.LoadInt32(&calls), int32(3); got != want {
 		t.Fatalf("request count mismatch: got %d want %d", got, want)
@@ -490,7 +599,7 @@ func TestUploadWorkerRetriesDoErrorsInContinuousMode(t *testing.T) {
 		}),
 	}
 
-	uploadWorker(ctx, recorder, client, true)
+	uploadWorker(ctx, recorder, client, true, nil)
 
 	if got, want := atomic.LoadInt32(&calls), int32(2); got != want {
 		t.Fatalf("request count mismatch: got %d want %d", got, want)
@@ -526,7 +635,7 @@ func TestUploadWorkerRetriesHTTPFailuresInContinuousMode(t *testing.T) {
 		}),
 	}
 
-	uploadWorker(ctx, recorder, client, true)
+	uploadWorker(ctx, recorder, client, true, nil)
 
 	if got, want := atomic.LoadInt32(&calls), int32(2); got != want {
 		t.Fatalf("request count mismatch: got %d want %d", got, want)

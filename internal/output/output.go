@@ -3,6 +3,7 @@ package output
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"sort"
@@ -229,6 +230,60 @@ func ProgressReporter(name string, done <-chan struct{}, jsonOutput bool, render
 				renderStatus(),
 			)
 			i++
+		}
+	}
+}
+
+type bidirectionalProgressRenderer struct {
+	writer   io.Writer
+	rendered bool
+}
+
+func (r *bidirectionalProgressRenderer) render(downloadMarker, uploadMarker, downloadStatus, uploadStatus string) {
+	if r.rendered {
+		fmt.Fprint(r.writer, "\033[1A")
+	}
+
+	fmt.Fprintf(r.writer, "\r\033[K%s Download: %s\n", downloadMarker, downloadStatus)
+	fmt.Fprintf(r.writer, "\r\033[K%s Upload:   %s", uploadMarker, uploadStatus)
+	r.rendered = true
+}
+
+func (r *bidirectionalProgressRenderer) clear() {
+	if !r.rendered {
+		return
+	}
+
+	// The cursor is left on the upload row. Clear it, move to the download
+	// row, and clear that as well so the final results can replace both rows.
+	fmt.Fprint(r.writer, "\r\033[K\033[1A\r\033[K")
+	r.rendered = false
+}
+
+func BidirectionalProgressReporter(done <-chan struct{}, jsonOutput bool, renderStatus func() (string, string)) {
+	if jsonOutput {
+		return
+	}
+
+	cyan := color.New(color.FgCyan).SprintFunc()
+	spinner := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	renderer := bidirectionalProgressRenderer{writer: os.Stdout}
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	defer renderer.clear()
+
+	for i := 0; ; i++ {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			downloadStatus, uploadStatus := renderStatus()
+			renderer.render(
+				cyan(spinner[i%len(spinner)]),
+				cyan(spinner[(i+len(spinner)/2)%len(spinner)]),
+				downloadStatus,
+				uploadStatus,
+			)
 		}
 	}
 }

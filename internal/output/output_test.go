@@ -1,6 +1,7 @@
 package output
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/idanyas/speedflare/internal/data"
@@ -44,5 +45,37 @@ func TestFormatServerLine(t *testing.T) {
 				t.Fatalf("format mismatch: got %q want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestBidirectionalProgressRendererUpdatesBothLinesInPlace(t *testing.T) {
+	var output bytes.Buffer
+	renderer := bidirectionalProgressRenderer{writer: &output}
+
+	renderer.render("D1", "U1", "100.00 Mbps", "50.00 Mbps")
+	renderer.render("D2", "U2", "110.00 Mbps", "55.00 Mbps")
+	renderer.clear()
+
+	want := "\r\033[KD1 Download: 100.00 Mbps\n" +
+		"\r\033[KU1 Upload:   50.00 Mbps" +
+		"\033[1A\r\033[KD2 Download: 110.00 Mbps\n" +
+		"\r\033[KU2 Upload:   55.00 Mbps" +
+		"\r\033[K\033[1A\r\033[K"
+	if got := output.String(); got != want {
+		t.Fatalf("rendered output mismatch:\n got: %q\nwant: %q", got, want)
+	}
+	if renderer.rendered {
+		t.Fatal("expected clear to reset the rendered state")
+	}
+}
+
+func TestBidirectionalProgressRendererClearBeforeFirstRenderIsNoop(t *testing.T) {
+	var output bytes.Buffer
+	renderer := bidirectionalProgressRenderer{writer: &output}
+
+	renderer.clear()
+
+	if got := output.String(); got != "" {
+		t.Fatalf("expected no output, got %q", got)
 	}
 }
