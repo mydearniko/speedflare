@@ -4,7 +4,7 @@ import (
 	"math"
 	"testing"
 
-	"github.com/idanyas/speedflare/internal/app"
+	"github.com/mydearniko/speedflare/internal/app"
 )
 
 func TestResolveTestMode(t *testing.T) {

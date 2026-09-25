@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/idanyas/speedflare/internal/data"
+	"github.com/mydearniko/speedflare/internal/data"
 )
 
 func TestFormatServerLine(t *testing.T) {

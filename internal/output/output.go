@@ -13,8 +13,8 @@ import (
 	"github.com/fatih/color"
 	"github.com/manifoldco/promptui"
 
-	"github.com/idanyas/speedflare/internal/data"
-	"github.com/idanyas/speedflare/internal/location"
+	"github.com/mydearniko/speedflare/internal/data"
+	"github.com/mydearniko/speedflare/internal/location"
 )
 
 func PrintHeader(jsonOutput bool, version string) {

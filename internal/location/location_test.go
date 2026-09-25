@@ -4,7 +4,7 @@ import (
 	"math"
 	"testing"
 
-	"github.com/idanyas/speedflare/internal/data"
+	"github.com/mydearniko/speedflare/internal/data"
 )
 
 func TestResolveDisplayReferenceUsesCountryAverageWhenGeoIPMissing(t *testing.T) {

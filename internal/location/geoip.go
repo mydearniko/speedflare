@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/idanyas/speedflare/internal/client"
+	"github.com/mydearniko/speedflare/internal/client"
 )
 
 type geoIPResponse struct {

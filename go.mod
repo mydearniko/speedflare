@@ -1,4 +1,4 @@
-module github.com/idanyas/speedflare
+module github.com/mydearniko/speedflare
 
 go 1.24
 

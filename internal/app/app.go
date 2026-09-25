@@ -19,10 +19,10 @@ import (
 
 	"github.com/fatih/color"
 
-	"github.com/idanyas/speedflare/internal/client"
-	"github.com/idanyas/speedflare/internal/data"
-	"github.com/idanyas/speedflare/internal/location"
-	"github.com/idanyas/speedflare/internal/output"
+	"github.com/mydearniko/speedflare/internal/client"
+	"github.com/mydearniko/speedflare/internal/data"
+	"github.com/mydearniko/speedflare/internal/location"
+	"github.com/mydearniko/speedflare/internal/output"
 )
 
 const (

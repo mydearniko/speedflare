@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/idanyas/speedflare/internal/data"
+	"github.com/mydearniko/speedflare/internal/data"
 )
 
 type roundTripperFunc func(*http.Request) (*http.Response, error)

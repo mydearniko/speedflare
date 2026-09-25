@@ -10,10 +10,10 @@ import (
 	"github.com/fatih/color"
 	"github.com/spf13/pflag"
 
-	"github.com/idanyas/speedflare/internal/app"
-	"github.com/idanyas/speedflare/internal/client"
-	"github.com/idanyas/speedflare/internal/location"
-	"github.com/idanyas/speedflare/internal/output"
+	"github.com/mydearniko/speedflare/internal/app"
+	"github.com/mydearniko/speedflare/internal/client"
+	"github.com/mydearniko/speedflare/internal/location"
+	"github.com/mydearniko/speedflare/internal/output"
 )
 
 var (
@@ -109,7 +109,7 @@ func main() {
 		fmt.Fprintln(out, "\nOptions:")
 		pflag.PrintDefaults()
 		fmt.Fprintf(out, "\nVersion: %s\n", version)
-		fmt.Fprintln(out, "Homepage: https://github.com/idanyas/speedflare")
+		fmt.Fprintln(out, "Homepage: https://github.com/mydearniko/speedflare")
 	}
 	pflag.CommandLine.Init(os.Args[0], pflag.ContinueOnError)
 	err := pflag.CommandLine.Parse(os.Args[1:])

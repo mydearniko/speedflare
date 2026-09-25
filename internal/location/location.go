@@ -18,8 +18,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/idanyas/speedflare/internal/client"
-	"github.com/idanyas/speedflare/internal/data"
+	"github.com/mydearniko/speedflare/internal/client"
+	"github.com/mydearniko/speedflare/internal/data"
 )
 
 var defaultProbeRanges = []string{
