@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -881,7 +881,7 @@ func resolveWithDoH(ctx context.Context, host string, ipv4Only, ipv6Only bool, i
 						return dialer.DialContext(dialCtx, dohNet, server.address)
 					},
 					DisableKeepAlives:     true,
-					ForceAttemptHTTP2:     true,
+					ForceAttemptHTTP2:     false,
 					TLSHandshakeTimeout:   5 * time.Second,
 					ExpectContinueTimeout: 1 * time.Second,
 				}

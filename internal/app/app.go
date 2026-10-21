@@ -2,12 +2,13 @@ package app
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -510,7 +511,7 @@ func measureDialLatency(transport *http.Transport, attempts int) (*data.LatencyR
 
 		// Introduce random jitter between attempts (0-50ms)
 		if i < attempts-1 {
-			time.Sleep(time.Duration(rand.Intn(50)) * time.Millisecond)
+			time.Sleep(time.Duration(rand.IntN(50)) * time.Millisecond)
 		}
 	}
 
@@ -556,7 +557,7 @@ func measureHTTPLatency(c *http.Client, transport *http.Transport, attempts int)
 		latencies = append(latencies, latency)
 
 		if i < attempts-1 {
-			time.Sleep(time.Duration(rand.Intn(50)) * time.Millisecond)
+			time.Sleep(time.Duration(rand.IntN(50)) * time.Millisecond)
 		}
 	}
 
@@ -923,7 +924,7 @@ type uploadStream struct {
 // regenerating it per request burned CPU and churned the heap.
 var uploadPayload = sync.OnceValue(func() []byte {
 	payload := make([]byte, 1<<20)
-	rand.Read(payload)
+	_, _ = cryptorand.Read(payload)
 	return payload
 })
 
