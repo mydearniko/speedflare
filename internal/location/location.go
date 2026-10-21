@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -156,41 +157,43 @@ func ProbeColos(userLat, userLon float64, userColo string, userCountryCode strin
 type coloProbeFunc func(string, ProbeOptions) (string, error)
 
 func probeColoTargets(ips []string, opts ProbeOptions, concurrency int, probe coloProbeFunc) map[string]string {
-	type probeResult struct {
-		Colo string
-		IP   string
-	}
-	results := make(chan probeResult, len(ips))
-	var wg sync.WaitGroup
-
 	if concurrency < 1 {
 		concurrency = 1
 	}
-	workerLimit := make(chan struct{}, concurrency)
+	if concurrency > len(ips) {
+		concurrency = len(ips)
+	}
 
-	for _, ip := range ips {
+	// A fixed pool avoids parking one goroutine (and its stack) per target.
+	var (
+		mu          sync.Mutex
+		wg          sync.WaitGroup
+		next        atomic.Int64
+		uniqueColos = make(map[string]string)
+	)
+	for range concurrency {
 		wg.Add(1)
-		go func(targetIP string) {
+		go func() {
 			defer wg.Done()
-			workerLimit <- struct{}{}
-			defer func() { <-workerLimit }()
-
-			colo, err := probe(targetIP, opts)
-			if err == nil && colo != "" {
-				results <- probeResult{Colo: colo, IP: targetIP}
+			for {
+				i := int(next.Add(1) - 1)
+				if i >= len(ips) {
+					return
+				}
+				targetIP := ips[i]
+				colo, err := probe(targetIP, opts)
+				if err != nil || colo == "" {
+					continue
+				}
+				mu.Lock()
+				if _, exists := uniqueColos[colo]; !exists {
+					uniqueColos[colo] = targetIP
+				}
+				mu.Unlock()
 			}
-		}(ip)
+		}()
 	}
-
 	wg.Wait()
-	close(results)
-
-	uniqueColos := make(map[string]string)
-	for res := range results {
-		if _, exists := uniqueColos[res.Colo]; !exists {
-			uniqueColos[res.Colo] = res.IP
-		}
-	}
 
 	return uniqueColos
 }
@@ -304,11 +307,19 @@ func probeSingleIP(ip string, opts ProbeOptions) (string, error) {
 		},
 		TLSHandshakeTimeout: 1500 * time.Millisecond,
 		DisableKeepAlives:   true,
+		// Each probe is a single tiny GET over a throwaway connection, so skip
+		// HTTP/2 framing state and the post-quantum key share: plain X25519
+		// keeps hundreds of concurrent handshakes cheap in CPU and memory.
 		TLSClientConfig: &tls.Config{
 			ServerName:         "speed.cloudflare.com",
 			InsecureSkipVerify: true,
+			CurvePreferences:   []tls.CurveID{tls.X25519},
+			NextProtos:         []string{"http/1.1"},
 		},
-		ForceAttemptHTTP2: true,
+		ForceAttemptHTTP2:  false,
+		DisableCompression: true,
+		WriteBufferSize:    1024,
+		ReadBufferSize:     2048,
 	}
 	if opts.ProxyURL != nil {
 		tr.Proxy = http.ProxyURL(opts.ProxyURL)
@@ -326,6 +337,10 @@ func probeSingleIP(ip string, opts ProbeOptions) (string, error) {
 				}
 				proxyTLSConfig := tr.TLSClientConfig.Clone()
 				proxyTLSConfig.ServerName = host
+				// The Cloudflare-specific handshake tuning does not apply to
+				// arbitrary proxies; keep Go's defaults for that hop.
+				proxyTLSConfig.CurvePreferences = nil
+				proxyTLSConfig.NextProtos = nil
 				tlsConn := tls.Client(conn, proxyTLSConfig)
 				if err := tlsConn.HandshakeContext(ctx); err != nil {
 					conn.Close()
