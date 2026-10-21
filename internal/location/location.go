@@ -214,7 +214,7 @@ func buildServerChoices(uniqueColos map[string]string, userLat, userLon float64,
 		}
 	}
 
-	var candidates []serverCandidate
+	candidates := make([]serverCandidate, 0, len(uniqueColos))
 	for colo, ip := range uniqueColos {
 		info, err := FindServerInfo(colo, allLocs)
 		if err != nil {
