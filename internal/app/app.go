@@ -775,12 +775,12 @@ func runBidirectionalTest(download, upload throughputWorker, client *http.Client
 	}
 
 	return data.Speed{
-			Mbps:   downloadSummary.mbps,
-			DataMB: downloadSummary.dataMB,
-		}, data.Speed{
-			Mbps:   uploadSummary.mbps,
-			DataMB: uploadSummary.dataMB,
-		}
+		Mbps:   downloadSummary.mbps,
+		DataMB: downloadSummary.dataMB,
+	}, data.Speed{
+		Mbps:   uploadSummary.mbps,
+		DataMB: uploadSummary.dataMB,
+	}
 }
 
 func runThroughputWorkers(start <-chan struct{}, ctx context.Context, cancel context.CancelFunc, recorder *throughputRecorder, client *http.Client, worker throughputWorker, workers int, continuous bool, limiter *bandwidthLimiter) <-chan struct{} {
@@ -817,7 +817,9 @@ func liveSpeedConfigForTest(name string) liveSpeedEstimatorConfig {
 }
 
 func downloadWorker(ctx context.Context, recorder *throughputRecorder, client *http.Client, continuous bool, limiter *bandwidthLimiter) {
-	buf := make([]byte, 256*1024)
+	// crypto/tls returns at most one record (16 KiB) per Read, so a larger
+	// buffer only costs memory.
+	buf := make([]byte, 32*1024)
 	for ctx.Err() == nil {
 		req, _ := http.NewRequestWithContext(ctx, "GET", "https://speed.cloudflare.com/__down?bytes=2147483648", nil)
 		resp, err := client.Do(req)
@@ -913,14 +915,19 @@ type uploadStream struct {
 	limiter   *bandwidthLimiter
 }
 
-func newUploadStream(ctx context.Context, recorder *throughputRecorder, size int64, limiter *bandwidthLimiter) io.Reader {
+// uploadPayload is generated once and shared read-only by every upload stream;
+// regenerating it per request burned CPU and churned the heap.
+var uploadPayload = sync.OnceValue(func() []byte {
 	payload := make([]byte, 1<<20)
 	rand.Read(payload)
+	return payload
+})
 
+func newUploadStream(ctx context.Context, recorder *throughputRecorder, size int64, limiter *bandwidthLimiter) io.Reader {
 	return &uploadStream{
 		ctx:       ctx,
 		recorder:  recorder,
-		payload:   payload,
+		payload:   uploadPayload(),
 		remaining: size,
 		limiter:   limiter,
 	}
