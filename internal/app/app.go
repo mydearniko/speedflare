@@ -63,6 +63,7 @@ type RunOptions struct {
 	SuppressIntro     bool
 	HideIP            bool
 	OriginIP          string
+	Locations         []data.Location
 	Mode              TestMode
 	Continuous        bool
 	DownloadLimitMbps float64
@@ -376,11 +377,14 @@ func RunSpeedTest(client *http.Client, opts RunOptions) (*data.TestResult, error
 		return nil, fmt.Errorf("failed to get server info: %w", err)
 	}
 
-	locs, err := location.FetchLocations(client)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get locations: %w", err)
+	locs := opts.Locations
+	if len(locs) == 0 {
+		var err error
+		locs, err = location.FetchLocations(client)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get locations: %w", err)
+		}
 	}
-
 	server, err := location.FindServerInfo(trace["colo"], locs)
 	if err != nil {
 		return nil, err

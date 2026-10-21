@@ -254,6 +254,9 @@ func main() {
 				suppressIntro = true
 			}
 
+			if httpClient != nil {
+				httpClient.CloseIdleConnections()
+			}
 			selectedOriginIP = servers[selectedIndex].IP
 			httpClient, err = client.NewHTTPClient(*ipv4, *ipv6, effectiveInterfaceName, *insecure, selectedOriginIP, *proxyAddress)
 			if err != nil {
@@ -275,6 +278,7 @@ func main() {
 		SuppressIntro:     suppressIntro,
 		HideIP:            *hideIP,
 		OriginIP:          selectedOriginIP,
+		Locations:         locs,
 		Mode:              mode,
 		Continuous:        *continuous,
 		DownloadLimitMbps: *downloadLimit,

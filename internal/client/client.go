@@ -29,6 +29,13 @@ type BrowserTransport struct {
 	RewriteOrigin bool
 }
 
+// CloseIdleConnections forwards connection cleanup to the underlying transport.
+func (t *BrowserTransport) CloseIdleConnections() {
+	if t != nil && t.Transport != nil {
+		t.Transport.CloseIdleConnections()
+	}
+}
+
 type dialTarget struct {
 	ip      string
 	network string
