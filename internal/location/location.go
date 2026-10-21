@@ -1,6 +1,9 @@
 package location
 
 import (
+	"bufio"
+	"bytes"
+	"cmp"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
@@ -8,11 +11,12 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -67,15 +71,15 @@ func GetServerTrace(client *http.Client) (map[string]string, error) {
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("reading trace response: %w", err)
-	}
+	scanner := bufio.NewScanner(io.LimitReader(resp.Body, 4096))
 	info := make(map[string]string)
-	for _, line := range strings.Split(string(body), "\n") {
-		if parts := strings.SplitN(line, "=", 2); len(parts) == 2 {
-			info[parts[0]] = parts[1]
+	for scanner.Scan() {
+		if k, v, ok := strings.Cut(scanner.Text(), "="); ok {
+			info[k] = v
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("reading trace response: %w", err)
 	}
 	return info, nil
 }
@@ -92,8 +96,8 @@ func FetchLocations(client *http.Client) ([]data.Location, error) {
 		return nil, err
 	}
 
-	sort.Slice(locations, func(i, j int) bool {
-		return locations[i].IATA < locations[j].IATA
+	slices.SortFunc(locations, func(a, b data.Location) int {
+		return strings.Compare(a.IATA, b.IATA)
 	})
 
 	return locations, nil
@@ -230,27 +234,27 @@ func buildServerChoices(uniqueColos map[string]string, userLat, userLon float64,
 		candidates = append(candidates, candidate)
 	}
 
-	sort.Slice(candidates, func(i, j int) bool {
+	slices.SortFunc(candidates, func(a, b serverCandidate) int {
 		// Priority 1: Same country as user
-		s1InCountry := candidates[i].server.Country == userCountryCode
-		s2InCountry := candidates[j].server.Country == userCountryCode
+		s1InCountry := a.server.Country == userCountryCode
+		s2InCountry := b.server.Country == userCountryCode
 
 		if s1InCountry && !s2InCountry {
-			return true
+			return -1
 		}
 		if !s1InCountry && s2InCountry {
-			return false
+			return 1
 		}
 
 		// Priority 2: Distance (if available)
 		if hasSortReference {
-			if math.Abs(candidates[i].sortDistance-candidates[j].sortDistance) > 1.0 { // tolerance
-				return candidates[i].sortDistance < candidates[j].sortDistance
+			if math.Abs(a.sortDistance-b.sortDistance) > 1.0 { // tolerance
+				return cmp.Compare(a.sortDistance, b.sortDistance)
 			}
 		}
 
 		// Priority 3: Alphabetical IATA
-		return candidates[i].server.IATA < candidates[j].server.IATA
+		return strings.Compare(a.server.IATA, b.server.IATA)
 	})
 
 	servers := make([]data.Server, 0, len(candidates))
@@ -376,17 +380,15 @@ func probeSingleIP(ip string, opts ProbeOptions) (string, error) {
 		return "", fmt.Errorf("probe returned status %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024))
-	if err != nil {
-		return "", fmt.Errorf("reading probe response: %w", err)
-	}
-	for _, line := range strings.Split(string(body), "\n") {
-		if strings.HasPrefix(line, "colo=") {
-			parts := strings.Split(line, "=")
-			if len(parts) == 2 {
-				return parts[1], nil
-			}
+	scanner := bufio.NewScanner(io.LimitReader(resp.Body, 1024))
+	for scanner.Scan() {
+		b := scanner.Bytes()
+		if bytes.HasPrefix(b, []byte("colo=")) {
+			return string(bytes.TrimPrefix(b, []byte("colo="))), nil
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("reading probe response: %w", err)
 	}
 	return "", fmt.Errorf("no colo found")
 }
@@ -410,18 +412,21 @@ func newProbeDialer(targetIP net.IP, interfaceOrIP string, enforceTargetFamily b
 }
 
 func haversine(lat1, lon1, lat2, lon2 float64) float64 {
-	dLat := (lat2 - lat1) * (math.Pi / 180.0)
-	dLon := (lon2 - lon1) * (math.Pi / 180.0)
+	const degToRad = math.Pi / 180.0
+	dLat := (lat2 - lat1) * degToRad
+	dLon := (lon2 - lon1) * degToRad
 
-	lat1 = lat1 * (math.Pi / 180.0)
-	lat2 = lat2 * (math.Pi / 180.0)
+	lat1 = lat1 * degToRad
+	lat2 = lat2 * degToRad
 
-	a := math.Sin(dLat/2)*math.Sin(dLat/2) + math.Sin(dLon/2)*math.Sin(dLon/2)*math.Cos(lat1)*math.Cos(lat2)
+	sinDLat2 := math.Sin(dLat / 2)
+	sinDLon2 := math.Sin(dLon / 2)
+
+	a := sinDLat2*sinDLat2 + sinDLon2*sinDLon2*math.Cos(lat1)*math.Cos(lat2)
 	c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
 
 	return earthRadiusKm * c
 }
-
 func generateRandomIPs(cidr string, count int) ([]string, error) {
 	_, ipnet, err := net.ParseCIDR(cidr)
 	if err != nil {
@@ -435,18 +440,19 @@ func generateRandomIPs(cidr string, count int) ([]string, error) {
 		totalHosts = 1
 	}
 
-	var ips []string
+	ips := make([]string, 0, count)
 	startIP := binary.BigEndian.Uint32(ipnet.IP)
 
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-
-	for i := 0; i < count; i++ {
-		offset := r.Intn(totalHosts)
+	for range count {
+		offset := rand.IntN(totalHosts)
 		ipInt := startIP + uint32(offset)
 
-		ip := make(net.IP, 4)
-		binary.BigEndian.PutUint32(ip, ipInt)
-		ips = append(ips, ip.String())
+		ips = append(ips, netip.AddrFrom4([4]byte{
+			byte(ipInt >> 24),
+			byte(ipInt >> 16),
+			byte(ipInt >> 8),
+			byte(ipInt),
+		}).String())
 	}
 	return ips, nil
 }

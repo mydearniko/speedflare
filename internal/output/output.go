@@ -6,7 +6,7 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -32,11 +32,11 @@ func ShowLocations(client *http.Client, jsonOutput bool) {
 		return
 	}
 
-	sort.Slice(locs, func(i, j int) bool {
-		if locs[i].CCA2 != locs[j].CCA2 {
-			return locs[i].CCA2 < locs[j].CCA2
+	slices.SortFunc(locs, func(a, b data.Location) int {
+		if a.CCA2 != b.CCA2 {
+			return strings.Compare(a.CCA2, b.CCA2)
 		}
-		return locs[i].City < locs[j].City
+		return strings.Compare(a.City, b.City)
 	})
 
 	if jsonOutput {

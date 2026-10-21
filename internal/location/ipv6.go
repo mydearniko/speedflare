@@ -256,9 +256,9 @@ func generateRandomIPv6s(cidr string, count int, rng *rand.Rand) ([]net.IP, erro
 	}
 
 	generated := make([]net.IP, 0, count)
-	for i := 0; i < count; i++ {
-		randomBytes := make([]byte, net.IPv6len)
-		_, _ = rng.Read(randomBytes)
+	var randomBytes [net.IPv6len]byte
+	for range count {
+		_, _ = rng.Read(randomBytes[:])
 
 		candidate := make(net.IP, net.IPv6len)
 		for j := range candidate {
