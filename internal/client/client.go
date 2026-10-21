@@ -40,6 +40,87 @@ type localAddrs struct {
 	ipv6          *net.TCPAddr
 }
 
+// resolvedHostTTL bounds how long a successful lookup is reused by one client.
+const resolvedHostTTL = 5 * time.Minute
+
+// resolveTimeout bounds a shared lookup that outlives the dial that started it.
+const resolveTimeout = 30 * time.Second
+
+// resolveCache deduplicates DNS work for a single HTTP client. Without it every
+// new connection (each worker, retry, latency probe) re-ran the parallel DoH
+// race, costing several TLS handshakes per dial.
+type resolveCache struct {
+	mu      sync.Mutex
+	entries map[string]*resolveEntry
+}
+
+type resolveEntry struct {
+	done    chan struct{}
+	ips     []net.IP
+	err     error
+	expires time.Time
+}
+
+// lookup returns cached IPs for key, or runs resolve once for all concurrent
+// callers. The shared resolution is detached from any single caller's
+// cancellation; each caller still stops waiting when its own ctx ends.
+// Failures are not cached.
+func (c *resolveCache) lookup(ctx context.Context, key string, resolve func(context.Context) ([]net.IP, error)) ([]net.IP, error) {
+	c.mu.Lock()
+	entry, ok := c.entries[key]
+	if ok {
+		select {
+		case <-entry.done:
+			if entry.err != nil || time.Now().After(entry.expires) {
+				ok = false
+			}
+		default:
+		}
+	}
+	if !ok {
+		entry = &resolveEntry{done: make(chan struct{})}
+		if c.entries == nil {
+			c.entries = make(map[string]*resolveEntry)
+		}
+		c.entries[key] = entry
+		resolveCtx, cancelResolve := context.WithTimeout(context.WithoutCancel(ctx), resolveTimeout)
+		go func() {
+			defer cancelResolve()
+			ips, err := resolve(resolveCtx)
+			c.mu.Lock()
+			entry.ips, entry.err = ips, err
+			entry.expires = time.Now().Add(resolvedHostTTL)
+			if err != nil && c.entries[key] == entry {
+				delete(c.entries, key)
+			}
+			c.mu.Unlock()
+			close(entry.done)
+		}()
+	}
+	c.mu.Unlock()
+
+	select {
+	case <-entry.done:
+		return entry.ips, entry.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// invalidate drops key so the next dial resolves again, e.g. after every
+// cached address failed to connect.
+func (c *resolveCache) invalidate(key string) {
+	c.mu.Lock()
+	if entry, ok := c.entries[key]; ok {
+		select {
+		case <-entry.done:
+			delete(c.entries, key)
+		default:
+		}
+	}
+	c.mu.Unlock()
+}
+
 func usableResolvedIP(ip net.IP, allowLoopback bool) bool {
 	if ip == nil || ip.IsUnspecified() {
 		return false
@@ -436,6 +517,7 @@ func NewHTTPClient(ipv4OnlyFlag, ipv6OnlyFlag bool, interfaceOrIP string, insecu
 			}
 		}
 	}
+	var dnsCache resolveCache
 
 	transport := &http.Transport{
 		Proxy: transportProxy,
@@ -506,7 +588,10 @@ func NewHTTPClient(ipv4OnlyFlag, ipv6OnlyFlag bool, interfaceOrIP string, insecu
 			}
 
 			allowLoopback := isProxyDial
-			resolvedIPs, resolveErr := resolveHost(ctx, host, currentIpv4Only, currentIpv6Only, insecureSkipVerify, tlsClientConfig.RootCAs, localAddrs.getInterfaceName(), allowLoopback)
+			cacheKey := fmt.Sprintf("%s|%t|%t|%t", strings.ToLower(host), currentIpv4Only, currentIpv6Only, allowLoopback)
+			resolvedIPs, resolveErr := dnsCache.lookup(ctx, cacheKey, func(ctx context.Context) ([]net.IP, error) {
+				return resolveHost(ctx, host, currentIpv4Only, currentIpv6Only, insecureSkipVerify, tlsClientConfig.RootCAs, localAddrs.getInterfaceName(), allowLoopback)
+			})
 			if resolveErr != nil {
 				return nil, fmt.Errorf("DNS resolution failed for %s: %w", host, resolveErr)
 			}
@@ -548,6 +633,9 @@ func NewHTTPClient(ipv4OnlyFlag, ipv6OnlyFlag bool, interfaceOrIP string, insecu
 				}
 			}
 
+			if ctx.Err() == nil {
+				dnsCache.invalidate(cacheKey)
+			}
 			return nil, fmt.Errorf("connection failed to all resolved IPs for %s:%s (first error: %v)", host, port, firstDialErr)
 
 		},
