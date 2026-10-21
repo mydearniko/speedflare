@@ -17,6 +17,8 @@ import (
 	"github.com/mydearniko/speedflare/internal/location"
 )
 
+var spinner = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
 func PrintHeader(jsonOutput bool, version string) {
 	if jsonOutput {
 		return
@@ -213,7 +215,10 @@ func ProgressReporter(name string, done <-chan struct{}, jsonOutput bool, render
 		return
 	}
 	cyan := color.New(color.FgCyan).SprintFunc()
-	spinner := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	cyanFrames := make([]string, len(spinner))
+	for i, s := range spinner {
+		cyanFrames[i] = cyan(s)
+	}
 	i := 0
 
 	ticker := time.NewTicker(100 * time.Millisecond)
@@ -225,7 +230,7 @@ func ProgressReporter(name string, done <-chan struct{}, jsonOutput bool, render
 			return
 		case <-ticker.C:
 			fmt.Printf("\r\033[K%s %s %s",
-				cyan(spinner[i%len(spinner)]),
+				cyanFrames[i%len(cyanFrames)],
 				name,
 				renderStatus(),
 			)
@@ -266,7 +271,10 @@ func BidirectionalProgressReporter(done <-chan struct{}, jsonOutput bool, render
 	}
 
 	cyan := color.New(color.FgCyan).SprintFunc()
-	spinner := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	cyanFrames := make([]string, len(spinner))
+	for i, s := range spinner {
+		cyanFrames[i] = cyan(s)
+	}
 	renderer := bidirectionalProgressRenderer{writer: os.Stdout}
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
@@ -279,8 +287,8 @@ func BidirectionalProgressReporter(done <-chan struct{}, jsonOutput bool, render
 		case <-ticker.C:
 			downloadStatus, uploadStatus := renderStatus()
 			renderer.render(
-				cyan(spinner[i%len(spinner)]),
-				cyan(spinner[(i+len(spinner)/2)%len(spinner)]),
+				cyanFrames[i%len(cyanFrames)],
+				cyanFrames[(i+len(cyanFrames)/2)%len(cyanFrames)],
 				downloadStatus,
 				uploadStatus,
 			)

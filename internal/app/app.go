@@ -303,8 +303,13 @@ func (e *liveSpeedEstimator) current(now time.Time) float64 {
 		at:         now,
 		totalBytes: totalBytes,
 	})
-	for len(e.samples) > 1 && now.Sub(e.samples[0].at) > e.config.window {
-		e.samples = e.samples[1:]
+	expired := 0
+	for expired < len(e.samples)-1 && now.Sub(e.samples[expired].at) > e.config.window {
+		expired++
+	}
+	if expired > 0 {
+		copy(e.samples, e.samples[expired:])
+		e.samples = e.samples[:len(e.samples)-expired]
 	}
 
 	denominator := activeDuration
