@@ -46,13 +46,13 @@ func GetUserCoordinates(interfaceOrIP, publicIP string, ipv4Only, ipv6Only bool,
 	if err != nil {
 		return 0, 0, err
 	}
-
+	defer httpClient.CloseIdleConnections()
 	resultCh := make(chan geoIPResponse, 1)
 	errCh := make(chan error, geoIPAttempts)
 	doneCh := make(chan struct{})
 
 	var wg sync.WaitGroup
-	for i := 0; i < geoIPAttempts; i++ {
+	for range geoIPAttempts {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
